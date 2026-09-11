@@ -1,0 +1,15 @@
+# 编译产物
+*.zip
+*.rar
+
+# 备份
+backups/
+归档_*/
+
+# 调试脚本
+mock_run.py
+validate_lua.py
+
+# 系统文件
+Thumbs.db
+.DS_Store

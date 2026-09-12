@@ -10,6 +10,14 @@ backups/
 mock_run.py
 validate_lua.py
 
+# 临时输出
+_*.txt
+*.pyc
+__pycache__/
+
+# 发布中间目录
+release/
+
 # 系统文件
 Thumbs.db
 .DS_Store

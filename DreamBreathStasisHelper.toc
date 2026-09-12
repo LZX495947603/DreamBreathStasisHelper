@@ -2,7 +2,7 @@
 ## Title: 绿喷管家
 ## Notes: 塑焰恩护唤魔师 - 梦境吐息(绿喷)与静滞冷却配合监测,提示何时必须停手
 ## Author: 炸鱼奶龙
-## Version: 1.31.0
+## Version: 1.35.0
 ## SavedVariables: DreamBreathStasisHelperDB
 ## X-Category: Evoker
 

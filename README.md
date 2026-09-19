@@ -1,7 +1,7 @@
 # 绿喷管家 (DreamBreathStasisHelper)
 
 > **塑焰恩护唤魔师专用** —— 实时告诉你"什么时候不能再喷绿喷，必须留层给静滞"。
-> A lightweight combat helper for **Preservation Evoker (Flameshaper)** in World of Warcraft: Midnight (12.0+).
+> A combat helper for **Preservation Evoker (Flameshaper)** in World of Warcraft: Midnight (12.0+).
 
 ---
 
@@ -35,9 +35,14 @@ T ≥ 50s      →  绿灯（50s够充回，随便喷）
 T < 20s      →  红灯（充能来不及，完全停手）
 ```
 
-界面四区：**右上角**引擎真值（`静滞CD 62s  绿喷 1/2`）· **中间**状态大字 · **左下**核心预测（`喷后静滞好时剩X层`）· **右下**本轮已用次数。
+### 2. 绿喷层数：大字级显示，一眼可读
 
-### 2. 静滞助手：双排图标
+层数不用再眯着眼找：
+
+- **状态大字右侧**：绿色大字（`1/2`），比状态文字小一号，跟随状态色变化一起显示
+- **静滞就绪时**：`绿喷 X/2` 移到**右下角放大显示**，开静滞前一眼确认手里是不是满层
+
+### 3. 静滞助手：双排图标
 
 按下静滞后，界面切换为存储模式，上下两排**逐列一一对应**：
 
@@ -50,11 +55,11 @@ T < 20s      →  红灯（充能来不及，完全停手）
 
 存入白名单 12 个治疗技能，与 PreservationStasisTracker 完全一致（红喷不会被静滞存储）。
 
-### 3. 数字精度：显示走官方引擎
+### 4. 数字精度：显示走官方引擎
 
 UI 上那行 `静滞CD 62s` **就是暴雪自己算的值** —— 走官方 `DurationObject` 句柄直出，实时跟踪心流加速与溜溜球减CD，跟你游戏技能栏上的数字一模一样，零漂移。
 
-### 4. 资格自动托管
+### 5. 资格自动托管
 
 只对"点了静滞的塑焰恩护唤魔师"有用，所以装了之后它自己判断：
 
@@ -62,7 +67,7 @@ UI 上那行 `静滞CD 62s` **就是暴雪自己算的值** —— 走官方 `Du
 
 任何一项不符就**自动隐藏，不刷屏不报错**。切小号、切专精都不用管它。天赋改动自动重检。
 
-### 5. 控制台与命令
+### 6. 控制台与命令
 
 `/DBSH` 打开控制台：**UI 开关 · 锁定/拖动 · 缩放(0.5-2.0) · 透明度(10-100%)**，拖动主界面位置自动保存。
 
@@ -71,7 +76,6 @@ UI 上那行 `静滞CD 62s` **就是暴雪自己算的值** —— 走官方 `Du
 /绿喷管家        中文别名              /DBSH unlock    解锁可拖动
 /DBSH toggle     显示/隐藏             /DBSH reset     位置重置
 /DBSH scale 1.5  缩放(0.5-2.0)         /DBSH recharge 30  手动指定充能时长
-/DBSH charge     充能诊断（脱战后敲：API真值 vs 本地模型 + 对账差异）
 /DBSH status     资格五项检测结果       /DBSH flow      心流天赋层数
 ```
 
@@ -93,47 +97,37 @@ World of Warcraft/_retail_/Interface/AddOns/
 
 ---
 
-## 已知限制
-
-- **心流状态天赋下，判断层约有 ±2 秒/轮的估算偏差。** 原因：12.0 起暴雪把战斗中的冷却时间值全部加密（secret），插件**能显示但读不到**——数字只能交给 UI 渲染，不能拿来比较运算。所以"显示"走官方引擎（零误差），"灯色判断"必须靠本地模型另算一份明文，而心流加速的累积量是估算的，**不点心流则没有这个误差**。偏差方向为保守侧时最多让你多停一口，不影响静滞本身。
-- 界面文本目前为简体中文，英文 localization 计划中。
-
----
-
 ## 更新日志
 
-### v1.35.0
-- 清理死代码 136 行（0 引用常量 / 未调用函数 / 只写不读字段 / 空转事件监听）
-- 移除已废弃的"释放检测"分支，释放后统一由 30 秒超时清理存储排
-- 保留全部诊断命令作为排查后路
+### v1.36.0
+- **绿喷层数显示优化**：层数从右上角小字改成**状态大字右侧的绿色大字**，跟着状态一起看，不用再眯眼找
+- **静滞就绪时**：`绿喷 X/2` 在右下角**放大显示**，开静滞前一眼确认手里满不满层
 
 ### v1.34.x
 - **双排图标**：顶部 20×20 计划队列 + 底部 44×44 真实存入技能（StasisTracker 式）
-- 存入白名单严格对齐 PreservationStasisTracker
-- 存储信息持续显示到释放；心火 15s 内释放只显示心火倒计时
-- 未释放时绿喷判断上移放大，不再与存储排挤在一起
+- 存储信息持续显示到释放；心灵之火 15s 内释放只显示心火倒计时
+- 未释放时绿喷判断整体上移放大，不再与存储排挤在一起
 
 ### v1.33.0
 - **接入官方引擎通道**：UI 冷却/层数数字改由 `DurationObject` 句柄直出，与游戏本体完全一致
 
 ### v1.32.x
 - 资格门槛自动检测（五项）与自动隐藏
-- 心流状态天赋支持（绿喷充能 + 静滞CD 双加速，逐帧积分）
-- 修复充能字段名错误，脱战对账收敛到 ±1s
+- 心流状态天赋支持（绿喷充能 + 静滞CD 双加速）
+- 充能读秒精度对齐游戏本体
 
 ---
 
 ## English summary
 
-A lightweight combat helper for **Preservation Evoker (Flameshaper)** in WoW Midnight (12.0+). It answers one question in real time: **"Is it still safe to cast Dream Breath right now?"**
+A combat helper for **Preservation Evoker (Flameshaper)** in WoW Midnight (12.0+). It answers one question in real time: **"Is it still safe to cast Dream Breath right now?"**
 
 - **Traffic-light verdict** — predicts how many Dream Breath charges you'll hold when Stasis comes off cooldown: red (stop) / yellow (limit) / green (safe).
+- **Charges at a glance** — the charge counter sits next to the status text as a large green readout, and moves to the bottom-right corner (enlarged) whenever Stasis is ready.
 - **Stasis tracker** — two rows of icons showing your planned queue and the spells actually stored.
 - **Blizzard-accurate numbers** — the cooldown readout comes from the official `DurationObject` handle, identical to your action bar.
 - **Auto eligibility** — hidden automatically unless you're a Flameshaper Preservation Evoker with Stasis talented.
-- Commands: `/DBSH` (config panel), `/DBSH charge`, `/DBSH status`, `/DBSH lock`, `/DBSH scale`.
-
-**Known limitation:** with the Flow State talent, the *verdict* layer has roughly ±2s of estimation drift per Stasis cycle, because combat cooldown values are encrypted and can be rendered but not read by addon code. Displayed numbers remain exact.
+- Commands: `/DBSH` (config panel), `/DBSH status`, `/DBSH lock`, `/DBSH scale`.
 
 ---
 

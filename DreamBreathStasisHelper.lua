@@ -10,7 +10,7 @@
 --     >= 2层    -> 绿灯: 放心喷
 --   另有静滞使用次数计数器作为辅助参考
 --
--- 作者: 炸鱼奶龙  版本: 1.35.0
+-- 作者: 炸鱼奶龙  版本: 1.36.0
 --==========================================================================
 
 local AddonName = ...
@@ -1539,11 +1539,13 @@ local function EngineChargesInfo()
     return out
 end
 
--- v1.33: line1 ("静滞CD Xs 绿喷 X/X") 的引擎渲染。
+-- v1.33: line1 的引擎渲染 (v1.35.1: 层数从这行拆出, 独立成大字号贴在大字右侧)。
 -- 用引擎句柄/引擎层数直接 SetFormattedText —— secret/clean 数值都能渲染,
 -- 显示值 = 游戏引擎真值 (含心流加速/溜溜球减CD), 不再经过本地模型。
+--   fs       = 右上角 CD 行 ("静滞CD Xs")
+--   chargeFs = 大字右侧的层数徽标 ("X/X", 绿色); 传 nil 则只渲染 CD 行
 -- 返回 true=已接管 (调用方不要再 SetText); false=引擎无数据, 走原路径。
-local function RenderEngineCDLine(fs, data)
+local function RenderEngineCDLine(fs, data, chargeFs)
     if not EngineSupported() then return false end
 
     -- 静滞部分: 仅状态机认为 COOLDOWN 时用句柄
@@ -1589,7 +1591,10 @@ local function RenderEngineCDLine(fs, data)
         maxArg = (data and data.dreamMax) or 2
     end
 
-    fs:SetFormattedText("静滞CD %.0fs  绿喷 %d/%d", stasisPart, curArg, maxArg)
+    fs:SetFormattedText("静滞CD %.0fs", stasisPart)
+    if chargeFs then
+        chargeFs:SetFormattedText("%d/%d", curArg, maxArg)
+    end
     return true
 end
 
@@ -1825,6 +1830,11 @@ end
 
 -- frame 的前向声明已上移到资格检测段 (RefreshEligibility 禁用时要 Hide 主UI)
 local statusText, dataText1, dataText2, counterText
+local dataCharges          -- v1.35.1: 绿喷层数独立大字 (贴在大字右侧, 绿色, 比大字小一号)
+-- v1.35.1 层数徽标字号 (比对应状态的大字小 4pt)
+local CHARGE_TEXT_SIZE       = 22   -- 常态大字 26pt
+local CHARGE_TEXT_SIZE_ARMED = 18   -- 存满待释放 (大字压到 22pt)
+local CHARGE_TEXT_SIZE_READY = 20   -- v1.35.2: 静滞就绪时右下角单独一行 (无大字陪衬, 独立放大)
 local border, indicator
 -- 静滞打开阶段的图标队列 (3个槽位: 绿喷·绿喷·时空畸体)
 -- queueIcons/Labels 表上移到 file-scope 早期, 这样后面定义的 UpdateUI 能用到
@@ -2044,6 +2054,15 @@ local function CreateUI()
     counterText:SetTextColor(COLOR.SUBTEXT.r, COLOR.SUBTEXT.g, COLOR.SUBTEXT.b)
     counterText:SetText("")
 
+    -- v1.35.1: 绿喷层数独立大字 (玩家反馈右上角 11pt 太小)
+    --   位置 = 紧贴大字右侧, 绿色, 比大字小 4pt; 只由 STOP/WARNING/SAFE 三态显示
+    dataCharges = frame:CreateFontString(nil, "OVERLAY")
+    dataCharges:SetFont(STANDARD_TEXT_FONT, CHARGE_TEXT_SIZE, "OUTLINE")
+    dataCharges:SetPoint("LEFT", statusText, "RIGHT", 10, 0)
+    dataCharges:SetTextColor(COLOR.SAFE.r, COLOR.SAFE.g, COLOR.SAFE.b)
+    dataCharges:SetText("")
+    dataCharges:Hide()
+
     -- 静滞打开阶段: 3个图标队列 (绿喷·绿喷·时空畸体)
     -- v1.34: 缩小成 20x20 挪到顶部 (TOP 锚点), xOffset 与下方大图标相同 = 逐列一一对应
     --   小图标(20) 至少是大图标(44)的一半以下, 满足"喷喷球图标要小一倍"
@@ -2146,6 +2165,8 @@ UpdateUI = function()
     local line2 = ""
     local counter = ""
     local mainIconPath = nil  -- 主图标纹理路径 (spell 图标)
+    -- v1.35.1: 层数徽标是否显示 (只有 STOP/WARNING/SAFE 三态显示, 其余状态大字/右下角已有层数)
+    local showCharges = false
 
     -- 非STASIS_OPENING状态: 还原主区域布局 (大图标 + 大字)
     if state ~= STATE.STASIS_OPENING then
@@ -2155,6 +2176,10 @@ UpdateUI = function()
         statusText:ClearAllPoints()
         statusText:SetFont(STANDARD_TEXT_FONT, 26, "OUTLINE")
         statusText:SetPoint("LEFT", indicator, "RIGHT", 12, 0)
+        -- v1.35.1: 层数徽标跟着大字走 (常态字号)
+        dataCharges:SetFont(STANDARD_TEXT_FONT, CHARGE_TEXT_SIZE, "OUTLINE")
+        dataCharges:ClearAllPoints()
+        dataCharges:SetPoint("LEFT", statusText, "RIGHT", 10, 0)
         dataText2:ClearAllPoints()
         dataText2:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 10, 50)
     end
@@ -2182,6 +2207,10 @@ UpdateUI = function()
         statusText:ClearAllPoints()
         statusText:SetFont(STANDARD_TEXT_FONT, 22, "OUTLINE")
         statusText:SetPoint("LEFT", indicator, "RIGHT", 10, 0)
+        -- v1.35.1: 层数徽标同步缩小 (与 22pt 大字配)
+        dataCharges:SetFont(STANDARD_TEXT_FONT, CHARGE_TEXT_SIZE_ARMED, "OUTLINE")
+        dataCharges:ClearAllPoints()
+        dataCharges:SetPoint("LEFT", statusText, "RIGHT", 8, 0)
         dataText2:ClearAllPoints()
         dataText2:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -8, 24)
     end
@@ -2203,7 +2232,13 @@ UpdateUI = function()
             -- 绿喷已满2层 -> 绿灯大字"可以开"
             color = COLOR.READY
             statusMsg = "静滞准备ok!"
-            line1 = string.format("绿喷 %d/%d 已满", charges, maxCharges)
+            -- v1.35.2: 层数从右上角挪到右下角并放大 (老板指定: 绿喷 X/2, 字体放大)
+            line1 = ""
+            dataCharges:SetFont(STANDARD_TEXT_FONT, CHARGE_TEXT_SIZE_READY, "OUTLINE")
+            dataCharges:ClearAllPoints()
+            dataCharges:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -8, 22)
+            dataCharges:SetText(string.format("绿喷 %d/%d", charges, maxCharges))
+            showCharges = true
             line2 = "绿喷已满，可以开静滞"
         else
             -- 绿喷没满 -> 橙/红警示, 大字显示具体层数
@@ -2274,8 +2309,7 @@ UpdateUI = function()
         color = COLOR.STOP
         statusMsg = "停手!"
         mainIconPath = GetSpellIconPath(DREAM_BREATH_SPELL_ID)
-        line1 = string.format("静滞CD %.0fs  绿喷 %d/%d",
-                              data.stasisCD or 0, data.dreamCharges or 0, data.dreamMax or 2)
+        line1 = string.format("静滞CD %.0fs", data.stasisCD or 0)
         line2 = string.format("喷后静滞好时剩%d层", data.projected or 0)
         frame.flashState = STATE.STOP
         indicator:Show()
@@ -2283,8 +2317,7 @@ UpdateUI = function()
         color = COLOR.WARNING
         statusMsg = "注意"
         mainIconPath = GetSpellIconPath(DREAM_BREATH_SPELL_ID)
-        line1 = string.format("静滞CD %.0fs  绿喷 %d/%d",
-                              data.stasisCD or 0, data.dreamCharges or 0, data.dreamMax or 2)
+        line1 = string.format("静滞CD %.0fs", data.stasisCD or 0)
         line2 = string.format("再喷1次剩 %d 层", data.projected or 0)
         frame.flashState = nil
         indicator:Show()
@@ -2293,14 +2326,19 @@ UpdateUI = function()
         statusMsg = "随便喷"
         mainIconPath = GetSpellIconPath(DREAM_BREATH_SPELL_ID)
         if data.stasisCD then
-            line1 = string.format("静滞CD %.0fs  绿喷 %d/%d",
-                                  data.stasisCD or 0, data.dreamCharges or 0, data.dreamMax or 2)
+            line1 = string.format("静滞CD %.0fs", data.stasisCD or 0)
         else
-            line1 = string.format("绿喷 %d/%d", data.dreamCharges or 0, data.dreamMax or 2)
+            line1 = ""    -- v1.35.1: 层数改由大字右侧的徽标显示, 这里不再重复
         end
         line2 = string.format("喷后静滞好时剩%d层", data.projected or 2)
         frame.flashState = nil
         indicator:Show()
+    end
+
+    -- v1.35.1: 层数徽标的三态门控 (STOP/WARNING/SAFE -> 挂在大字右侧)
+    -- v1.35.2: 改成"条件置位", 这样 STASIS_READY 分支自己设的 true (右下角放大) 不会被覆盖
+    if state == STATE.STOP or state == STATE.WARNING or state == STATE.SAFE then
+        showCharges = true
     end
 
     -- 计数器: 默认始终显示, 静滞CD中且用过绿喷时显示 "已用X"
@@ -2318,16 +2356,29 @@ UpdateUI = function()
     border:SetBackdropBorderColor(color.r, color.g, color.b, 0.85)
     statusText:SetText(statusMsg)
     statusText:SetTextColor(color.r, color.g, color.b)
-    -- v1.33: CD/层数行优先走引擎句柄 (战斗中 secret-safe, 显示=引擎真值含加速/减CD)
-    -- 仅限这三个状态 (line1 都是"静滞CD Xs 绿喷 X/X"格式); pcall 双保险:
-    -- 引擎路径任何意外抛错 -> 回退原 SetText, UI 不冻帧
+    -- v1.33: CD 行优先走引擎句柄 (战斗中 secret-safe, 显示=引擎真值含加速/减CD)
+    -- v1.35.1: 层数已拆成独立徽标 (大字右侧, 绿色) -> 一起交给引擎渲染
+    -- 仅限这三个状态; pcall 双保险: 引擎路径任何意外抛错 -> 回退原 SetText, UI 不冻帧
     local _engTaken = false
     if state == STATE.STOP or state == STATE.WARNING or state == STATE.SAFE then
-        local _engOK, taken = pcall(RenderEngineCDLine, dataText1, data)
+        local _engOK, taken = pcall(RenderEngineCDLine, dataText1, data, dataCharges)
         _engTaken = _engOK and taken
     end
     if not _engTaken then
         dataText1:SetText(line1)
+        -- 引擎不可用 -> 层数徽标走本地模型 (clean 明文, 不涉及 secret)
+        -- v1.35.2: STASIS_READY 分支已自己写好 "绿喷 X/2" (带前缀 + 右下角锚点), 不能覆盖
+        if state ~= STATE.STASIS_READY then
+            dataCharges:SetFormattedText("%d/%d", data.dreamCharges or 0, data.dreamMax or 2)
+        end
+    end
+    -- v1.35.1: 仅 STOP/WARNING/SAFE 三态显示层数徽标
+    --   (STASIS_READY 大字本身就是"绿喷 1/2"; 打开阶段右下角已有层数, 避免重复)
+    if showCharges then
+        dataCharges:SetTextColor(COLOR.SAFE.r, COLOR.SAFE.g, COLOR.SAFE.b)
+        dataCharges:Show()
+    else
+        dataCharges:Hide()
     end
     dataText2:SetText(line2 or "")
     counterText:SetText(counter)

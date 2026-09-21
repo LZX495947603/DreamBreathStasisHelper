@@ -99,6 +99,11 @@ World of Warcraft/_retail_/Interface/AddOns/
 
 ## 更新日志
 
+### v1.37.0
+- **修复：取消蓄力不再被算作已释放** —— 按住绿喷蓄力后按 `Esc` 取消，插件不会再误扣一层，也不会多记一次"已用"
+- **心流状态下冷却更准** —— 点了心流状态天赋时，绿喷充能与静滞冷却的读秒和判断基准都更贴近游戏本体（原先在加速窗口开始／结束的瞬间会有偏差，长时间战斗会累积）
+- **长战斗稳定性** —— 连续战斗数分钟、反复起停充能的情况下，层数与冷却时间不再随时间累积偏移
+
 ### v1.36.0
 - **绿喷层数显示优化**：层数从右上角小字改成**状态大字右侧的绿色大字**，跟着状态一起看，不用再眯眼找
 - **静滞就绪时**：`绿喷 X/2` 在右下角**放大显示**，开静滞前一眼确认手里满不满层
@@ -126,6 +131,7 @@ A combat helper for **Preservation Evoker (Flameshaper)** in WoW Midnight (12.0+
 - **Charges at a glance** — the charge counter sits next to the status text as a large green readout, and moves to the bottom-right corner (enlarged) whenever Stasis is ready.
 - **Stasis tracker** — two rows of icons showing your planned queue and the spells actually stored.
 - **Blizzard-accurate numbers** — the cooldown readout comes from the official `DurationObject` handle, identical to your action bar.
+- **Accurate under Flow State** — Dream Breath recharge and Stasis cooldown stay aligned with the client while the Flow State window opens and expires; the verdict stays right through long fights.
 - **Auto eligibility** — hidden automatically unless you're a Flameshaper Preservation Evoker with Stasis talented.
 - Commands: `/DBSH` (config panel), `/DBSH status`, `/DBSH lock`, `/DBSH scale`.
 

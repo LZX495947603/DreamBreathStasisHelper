@@ -10,7 +10,7 @@
 --     >= 2层    -> 绿灯: 放心喷
 --   另有静滞使用次数计数器作为辅助参考
 --
--- 作者: 炸鱼奶龙  版本: 1.36.0
+-- 作者: 炸鱼奶龙  版本: 1.37.0
 --==========================================================================
 
 local AddonName = ...
@@ -103,6 +103,13 @@ local TEMPORAL_ANOMALY_SPELL_ID = 373861
 --   → 说明失败点不在词表, 而在"遍历拿到的 spellID 查不到名字"或"根本查不到名字 API"。
 --   ID 匹配不依赖任何取名字的 API, 是更硬的判据; 名字匹配降级为兜底。
 local FLOW_STATE_ID = 385696                 -- 天赋本体 spellID (面板实测)
+-- 【v1.36.10 真机实测: 天赋 ID != buff aura ID, 两者都要留着】
+--   2026-09-21 00:31 老板 `/DBSH flow` 真机输出:
+--     GetPlayerAuraBySpellID(385696) → 查不到
+--     同一次遍历 helpful aura 第 [11] 条 → id=390148 name="心流状态" dur=10 剩余=7.4s (明文可读)
+--   → 385696 是**天赋节点** ID(用来查天赋树点没点), 390148 才是挂在身上的**光环** ID。
+--   要读"buff 还剩几秒"必须用 390148。FLOW_STATE_IDS 里只放天赋 ID, 别混入 aura ID。
+local FLOW_AURA_ID = 390148                  -- 心流状态 buff aura ID (真机实测, 脱战明文可读)
 local FLOW_STATE_NAMES = { ["心流状态"] = true, ["Flow State"] = true }
 local FLOW_STATE_IDS = { [FLOW_STATE_ID] = true }
 local FLOW_RATE_PER_RANK = 0.05   -- 每层冷却加速 5%
@@ -409,14 +416,17 @@ local chargeModel = {
     nextChargeAt = nil,    -- 下一层充好的绝对时间戳 (GetTime()) — 满层时为 nil
 }
 
--- v1.32.9 诊断: 绿喷充能"记账流水"(最近10条)。绿喷层数=API校准+施放扣层+到期结算三者叠加,
---   出问题时肉眼很难复现, 这里把三类事件按时间记下来, /DBSH charge 一键导出。
---   只在"层数真的变化"时记录, 避免每帧刷屏。
+-- v1.32.9 诊断: 绿喷充能"记账流水" + v1.36.36 起纳入**静滞状态变迁**。
+--   绿喷层数=API校准+施放扣层+到期结算三者叠加, 出问题时肉眼很难复现, 这里把事件按时间记下来,
+--   /DBSH charge 一键导出; 战斗中用 /DBSH next 也能看到最近几条(**纯本地记录, 不碰 API**)。
+--   ⚠️ 容量 10 -> 20 (v1.36.36): 静滞一轮要占 3 条(激活/存满起算/释放), 而"蓄力取消"很频繁,
+--      10 条会被绿喷记录挤满, 静滞那 3 条活不到你看的时候。
+local CHARGE_DIAG_MAX = 20
 local chargeDiag = { events = {} }
 local function ChargeDiag(msg)
     local log = chargeDiag.events
     log[#log + 1] = string.format("[%.1fs] %s", GetTime(), msg)
-    if #log > 10 then table.remove(log, 1) end
+    if #log > CHARGE_DIAG_MAX then table.remove(log, 1) end
 end
 
 -- 时空畸体给绿喷充能减的秒数 (**仅当点了"诺兹多姆的讲义"天赋时才生效**)
@@ -444,7 +454,20 @@ local function IsSafeNumber(v)
     return ok
 end
 
+-- v1.36.26: 诊断采样期间"暂停一切官方值校准"的总开关。
+--   ⚠️ **必须声明在 SyncChargeModel 之前** —— Lua 是词法作用域, 函数体只捕获**声明在它前面**的 local;
+--   若声明在后面, 函数体里读到的会是**全局变量**(nil), 守卫静默失效(这个坑真实踩到过)。
+--   声明点在这里; 1489 行附近只做赋值(=false), 不再重复写 local(否则会创建**第二个**变量)。
+local probeSuspendSync = false
+
 local function SyncChargeModel(dreamInfo)
+    -- v1.36.26 守卫必须放在**函数体内**, 不能只加在事件分支上 ——
+    --   老板 2026-09-21 指出: "脱战永远测不出差异"。根因 = EvaluateState() 每帧调
+    --   SyncChargeModel(1921 行), 而 UpdateUI 每帧跑 → 采样期间模型被官方值**每帧拉平**。
+    --   表现: 绿喷差永远 0.00s(假象); 而静滞因为 SyncStasisCooldownFromAPI 的守卫在函数内(1492),
+    --   所以静滞测得出 -4.5s 那种真偏差 —— 两者行为不一致正说明绿喷这条被漏掉了。
+    --   注: /DBSH time 的"起点对齐"在 probeSuspendSync=true **之前**调用, 不受影响。
+    if probeSuspendSync then return end
     if dreamInfo and not dreamInfo.secret and dreamInfo.currentCharges then
         -- v1.30: currentCharges/maxCharges 本身也可能是 secret(战斗中 API 透出的值),
         --   一比较就抛错。这里直接跳过校准(等出战斗再校准), 不污染本地模型。
@@ -499,6 +522,23 @@ local function SyncChargeModel(dreamInfo)
     end
 end
 
+-- v1.36.37 🔴 统一的"下一层充能时长" —— **必须与 ChargeModelConsume 的折算口径一致**
+--   为什么(老板 2026-09-21 长战斗数据, 脱战对账 `模型1层/6.5s vs API2层/0.0s 差-1层/+6.5s`):
+--     "某一层充能完成"那一刻, **新一轮充能的时长也应按当时的 rate 折算** ——
+--     这和"施放扣层起算"是完全同一个物理场景(一次新的充能开始)。
+--     但旧代码在完成分支里写死 `+recharge(=30)`, 而 `ChargeModelConsume` 会折成 27.27
+--     → **两条路径口径不一致**: 窗口开着时每完成一层, 模型就比游戏慢 2.73s,
+--       长战斗里叠十几层就是"整整一层"的滞后(正是长战斗漂移的来源)。
+--   注: 折的是"起算时长"; 之后窗口开/关的变化由 FlowConvertRemaining 换算接手(与扣层路径同构)。
+local function LocalRechargeDuration()
+    local base = (db and db.customRecharge) or chargeModel.rechargeTotal
+    if not IsSafeNumber(base) then base = DREAM_BREATH_CHARGE_BASE end
+    if (flowState.rank or 0) > 0 and flowUntil > GetTime() then
+        base = base / (1 + FLOW_RATE_PER_RANK * flowState.rank)
+    end
+    return base
+end
+
 -- 本地推算当前充能 (战斗中 dreamInfo 的替身)
 -- 核心: 用 nextChargeAt 绝对时间戳倒计时, 支持时空畸体减CD
 local function GetLocalChargeInfo()
@@ -517,7 +557,8 @@ local function GetLocalChargeInfo()
     --   导致绿喷实际涨到2层了但本地模型还显示1层。
     if chargeModel.currentCharges < chargeModel.maxCharges
        and not chargeModel.nextChargeAt then
-        chargeModel.nextChargeAt = GetTime() + recharge
+        -- v1.36.37: 用 LocalRechargeDuration()(含心流折算) 而不是写死的 recharge
+        chargeModel.nextChargeAt = GetTime() + LocalRechargeDuration()
     end
 
     -- 先把到期充能结算进层数 (可能连充多层)
@@ -528,11 +569,16 @@ local function GetLocalChargeInfo()
         if chargeModel.currentCharges >= chargeModel.maxCharges then
             chargeModel.nextChargeAt = nil
         else
-            chargeModel.nextChargeAt = chargeModel.nextChargeAt + recharge
+            -- v1.36.37 🔴 关键修复: 这里原本是 `+ recharge`(写死 30), 与 ChargeModelConsume 的
+            --   折算口径不一致 -> 窗口开着时每完成一层模型慢 2.73s -> 长战斗累积成一整层。
+            chargeModel.nextChargeAt = chargeModel.nextChargeAt + LocalRechargeDuration()
         end
         -- v1.32.10 诊断: 涨层是最直观的对照点 (游戏图标 +1 的瞬间), 必须留痕
-        ChargeDiag(string.format("充能完成 -> %s/%s 层",
-            tostring(chargeModel.currentCharges), tostring(chargeModel.maxCharges)))
+        -- v1.36.37: 顺带打出**推进后的下一层时钟** —— 长战斗里"模型为什么慢一层"就靠这行判
+        ChargeDiag(string.format("充能完成 -> %s/%s 层 (下一层 %s)",
+            tostring(chargeModel.currentCharges), tostring(chargeModel.maxCharges),
+            chargeModel.nextChargeAt and string.format("%.1fs后", chargeModel.nextChargeAt - GetTime())
+                or "满层"))
     end
 
     local nextIn = 0
@@ -558,17 +604,30 @@ local function ChargeModelConsume(spellID)
     -- v1.19 修复: 扣层后若没在充能(如1层时nextChargeAt=nil), 必须立即开始充能,
     --   否则0层永远不涨层(卡死0/2)。原来只在 wasFull 时设置 nextChargeAt,
     --   导致"1层放绿喷→0层"后 nextChargeAt 仍是 nil, 充能时钟丢失。
+    -- v1.36.16 心流折算: 新一层充能"起算"时, 若心流窗口开着, 游戏把总时长折算(30 → 30/1.1 = 27.27)。
+    --   实测(01:08): 新层剩余 26.7s ≈ 27.27 − 流逝 ✓ (若是 30 则该是 29.4 ✗)。
+    --   → 绿喷改用与静滞相同的"折算"模型, **不再逐年逐帧积分**(引擎 Δ 恒为 -1.0 已证, 见 TickFlowAcceleration)。
+    --   前提: 无天赋时 rank=0 / 窗口没开 → dur 就是 rechargeTotal(30), 与"不点心流时准"的既有行为一致 ✓
+    local dur = chargeModel.rechargeTotal
+    local discounted = false
+    if (flowState.rank or 0) > 0 and flowUntil > GetTime() then
+        dur = dur / (1 + FLOW_RATE_PER_RANK * flowState.rank)
+        discounted = true
+    end
     if wasFull then
-        chargeModel.nextChargeAt = GetTime() + chargeModel.rechargeTotal
+        chargeModel.nextChargeAt = GetTime() + dur
     elseif chargeModel.currentCharges < chargeModel.maxCharges
            and (not chargeModel.nextChargeAt or chargeModel.nextChargeAt < GetTime()) then
         -- 非满层且没在充能: 立即开始充下一层
-        chargeModel.nextChargeAt = GetTime() + chargeModel.rechargeTotal
+        chargeModel.nextChargeAt = GetTime() + dur
     end
     -- v1.32.9 诊断流水
-    ChargeDiag(string.format("绿喷施放 spellID=%s: 层%s->%s/%s, 单层充能%.1fs",
+    -- v1.36.20: 打印**本次实际采用**的充能时长(dur), 并标注是否折算过心流 ——
+    --   /DBSH track 只能看到"结果差多少", 看不到"折算有没有真的发生", 靠这条流水补上。
+    ChargeDiag(string.format("绿喷施放 spellID=%s: 层%s->%s/%s, 本次充能%.2fs(基准%.1f)%s",
         tostring(spellID), tostring(before), tostring(chargeModel.currentCharges),
-        tostring(chargeModel.maxCharges), chargeModel.rechargeTotal))
+        tostring(chargeModel.maxCharges), dur, chargeModel.rechargeTotal,
+        discounted and " [已折算心流]" or ""))
 end
 
 -- 时空畸体施放: 绿喷充能减CD —— **仅当点了"诺兹多姆的讲义"天赋时才生效**
@@ -1024,6 +1083,7 @@ local stasisState = {
     storedCount = 0,       -- STORING 阶段已存的白名单治疗技能数 (存满3 -> ARMED)
     innerfireEndTime = 0,  -- 心灵之火15s buff 的结束时间 (按下静滞立刻开始, 独立倒计时)
     thirdCastStartTime = 0, -- 第3个技能"施法开始"时刻 (CD起算锚点, 见 OnStasisArmed)
+    cdAnchoredAt = 0,       -- v1.36.11: 本轮 CD **实际采用**的起算时刻 (供"模型锚点 vs 游戏 startTime"对比)
     storedTemporalAnomalies = 0, -- v1.20: STORING阶段存入的时空畸体(溜溜球)数量, 释放时补算减CD
     stasisReleaseTime = 0,  -- v1.20: 静滞释放时刻, 用于去重(释放的溜溜球不再重复减CD)
 }
@@ -1180,6 +1240,73 @@ GetTalentRankByName = function(namesTable, idsSet)
     return 0, nil
 end
 
+-- v1.36.10: 直接读"心流状态"光环的剩余秒 —— 比"事件 + 10s"推算更硬
+--   为什么更硬: ① 不怕漏收施法事件; ② 现在的推算从 `SUCCEEDED` 起算, 而 `SUCCEEDED` 在
+--   **开始蓄力**那一刻就发了(见 CAST_PROBE 段注释), aura 却是蓄力**完成**才刷 ——
+--   真机实测两者的窗口结束时刻差 0.8s(模型偏早), 读 aura 能把这 0.8s 修掉。
+-- 返回: remain(秒, 可能 nil), state("OK"/"secret"/"noapi"/"noaura")
+-- 注意: 必须用 FLOW_AURA_ID(390148), **不是**天赋 ID(385696) —— 两者不同, 见常量处注释
+local function ReadFlowAuraRemain()
+    if not (C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID) then return nil, "noapi" end
+    local ok, d = pcall(C_UnitAuras.GetPlayerAuraBySpellID, FLOW_AURA_ID)
+    if not ok or type(d) ~= "table" then return nil, "noaura" end
+    local remain, state = nil, "OK"
+    local ok2 = pcall(function()
+        local e = d.expirationTime
+        if issecretvalue and issecretvalue(e) then state = "secret" return end
+        if type(e) == "number" and e > 0 then
+            remain = e - GetTime()
+        else
+            state = "noaura"
+        end
+    end)
+    if not ok2 then return nil, "secret" end
+    return remain, state
+end
+
+-- v1.36.32 心流"速率换算" —— 把两个计时器的**剩余时间**按当前 rate 比值缩放。
+--   机制(真机铁证 02:40, 详见 TickFlowAcceleration 上方说明): 游戏内部是"剩余进度 ÷ 当前速率",
+--   所以速率一变, 剩余时间就要按比例换算:
+--     · 开窗(速率 1.0→1.1): mul = 1/factor < 1 → 剩余**变短**
+--     · 过期(速率 1.1→1.0): mul = factor  > 1 → 剩余**变长**
+--   **必须在状态变化的那一刻当场换算**(不能拖到下一帧) —— 否则中间若发生"溜溜球减CD"等事件,
+--   会按错误的基准参与运算(行为测试 F 用例当场抓出: 期望 22.27, 延迟换算会得到 22.73)。
+-- ⚠️ 这个标志声明必须在 OnFlowWindowRefresh / TickFlowAcceleration **之前**（Lua 词法作用域，
+--   声明写在后面的话函数体读到的是全局 nil —— v1.36.26 就栽过一次）。
+local flowWasActive = false
+-- v1.36.35: 记下"刚刚发生的速率换算" —— 采样行上直接标注, 回答"模型为什么突然跳了 ±8s"。
+--   为什么需要: 战斗中读不到心流 aura, "这次换算是该发生还是误触发"没法当场核对;
+--   但至少要让"发生了什么、换了多少"看得见 —— 否则数字一跳就只剩猜。
+local lastFlowConv = nil   -- { t=, tag=, mul=, dCharge=, dStasis= }
+
+local function FlowConvertRemaining(mul)
+    local now = GetTime()
+    local dC, dS = 0, 0
+    pcall(function()
+        -- 绿喷"下一层"
+        if chargeModel.currentCharges and chargeModel.nextChargeAt
+           and chargeModel.currentCharges < (chargeModel.maxCharges or 2)
+           and chargeModel.nextChargeAt > now then
+            local rem = chargeModel.nextChargeAt - now
+            chargeModel.nextChargeAt = now + rem * mul
+            dC = rem * mul - rem
+            ChargeDiag(string.format("心流换算 绿喷下一层: 剩余%.1fs -> %.1fs (x%.3f)", rem, rem * mul, mul))
+        end
+        -- 静滞 CD (ARMED 阶段 CD 已在跑, 同样要算)
+        if (stasisState.phase == "ARMED" or stasisState.phase == "COOLDOWN")
+           and stasisState.cooldownEndTime and stasisState.cooldownEndTime > now then
+            local remS = stasisState.cooldownEndTime - now
+            stasisState.cooldownEndTime = now + remS * mul
+            dS = remS * mul - remS
+            ChargeDiag(string.format("心流换算 静滞CD: 剩余%.1fs -> %.1fs (x%.3f)", remS, remS * mul, mul))
+        end
+    end)
+    if math.abs(dC) > 0.05 or math.abs(dS) > 0.05 then
+        lastFlowConv = { t = now, tag = (mul < 1 and "开窗" or "过期"), mul = mul,
+                         dCharge = dC, dStasis = dS }
+    end
+end
+
 -- 心流窗口开启/刷新: 蓄力施放成功时调用 (v1.32.5 起只管窗口, 不再当场一次性移位)
 -- buff 不叠层, 重复施放只把窗口刷新成"从现在起 10s"
 local function OnFlowWindowRefresh()
@@ -1187,65 +1314,57 @@ local function OnFlowWindowRefresh()
     local now = GetTime()
     local wasActive = (flowUntil > now)
     flowUntil = now + FLOW_WINDOW
+    -- v1.36.14 开窗折算静滞CD: 游戏在"心流窗口从关→开"的那一瞬间, 把静滞 CD 的**剩余时间按 rate 折算**。
+    --   实测(01:08, 窗口在采样中途开启): API 剩余 74.9s →(开窗)→ 67.1s ≈ 74.9/1.1 再流逝 1s;
+    --   之后按**真实秒** -1.0/秒 递减(引擎 Δ 恒为 -1.0) —— 所以不是"逐帧加速", 而是"开窗瞬间折算一次"。
+    --   旧实现只在「CD 起算那一刻窗口已开」才折算(v1.36.12), 漏了"起算后才开窗"这种最常见的战斗情况。
+    --   注: 只在"关→开"时折算; 窗口已开着再刷新(wasActive=true)不折, 免得重复缩水。
+    -- v1.36.17 折算的第一道锁: **每周期只折一次** —— 游戏把 duration 折一次后就不再变
+    --   (即使窗口过期/再刷新); "每次开窗都折"会重复缩水 → 模型偏快(危险方向)。
+    -- ⚠️ v1.36.37: 上面那段"每周期只折一次"的锁(以及配套的 flowDiscounted 标志)**已整体删除** ——
+    --   v1.36.32 起改为"成对换算"(开窗 ÷factor / 过期 ×factor), 天然对称、不需要一次性锁;
+    --   标志只写不读, 会误导后来读代码的人, 按项目惯例清掉。
+    -- v1.36.32: 窗口**从关→开**的这一帧**当场**换算(剩余 ÷factor)。
+    --   为什么必须当场(不能拖到下一帧的 TickFlowAcceleration): 中间可能夹着"溜溜球减CD"等事件,
+    --   会按错误的基准参与运算 —— 行为测试 F 用例实测: 当场换算 22.27 ✓ / 延迟换算 22.73 ✗。
+    --   反向的"过期"没有事件可挂, 只能靠 TickFlowAcceleration 每帧检测(延迟 ≤1 帧, 可忽略)。
+    --   ⚠️ 旧实现**只在开窗时折、过期后不还原** → "窗口只覆盖充能一部分"时模型**偏快**(危险方向)。
+    --   真机铁证(2026-09-21 02:40): 窗口期内差恒 0.0s, 但**过期那一刻引擎剩余 +1.2s**(Δ引擎=+0.2),
+    --   而模型继续 -1.0 → 差跳到 -1.2s 并保持。
+    local factor = 1 + FLOW_RATE_PER_RANK * flowState.rank
+    if (not wasActive) and factor > 0 then
+        FlowConvertRemaining(1 / factor)
+    end
+    flowWasActive = true
     Trace(string.format("心流状态%d层: 窗口%s, 持续%.0fs",
         flowState.rank, wasActive and "刷新" or "开启", FLOW_WINDOW))
 end
 
--- 心流加速: 按真实时间积分累加到冷却计时器 (v1.32.5 逐帧积分, v1.32.10 恢复作用范围)
--- 【v1.32.10 作用范围(最终定版)】心流**同时**作用于绿喷充能和静滞 CD ——
---   Wiki 原文 "increasing ... cooldown recharge rate", 且官方 hotfix 专门修过 Dream Breath。
---   v1.32.9 曾误删绿喷充能加速(当时误信"绿喷固定30s不受影响"), 实机"还是对不上"后
---   回查 Wiki 才确认: 真凶是溜溜球在**没点诺兹多姆讲义**时也减CD, 与心流无关。
--- 【为什么用逐帧积分】按 dt 累积到绝对时间戳, 只在"窗口有效 且 该计时器确实在倒计时"
---   时累加, 天然处理"满层空转""只剩几秒就完成"等边界(旧的施放瞬间移位法做不到)。
--- 【防重复积分】dt 由时间戳差算出(不依赖 elapsed 参数), 故 OnUpdate 与 C_Timer 兜底
---   同时调用也不会重复累计。
-local lastFlowTick = 0
-local flowTickErr1, flowTickErr2 = false, false
+-- 【v1.36.32 定版】心流加速的真实机制 = **"剩余进度 ÷ 当前速率"** ——
+--   真机铁证(2026-09-21 02:40 `/DBSH time`, 一次采样同时给出两个关键现象):
+--     ① **窗口期内**引擎 Δ 恒为 **-1.0**(不是 -1.1) —— 看着"完全没加速";
+--     ② **窗口过期那一瞬间**引擎剩余**反而 +1.2s**(Δ引擎=+0.2) —— 倒计时不可能自己变长。
+--   只有一种模型能同时解释这两条:
+--     · 游戏维护的是"剩余**进度**"(以 1.0 速率计), 心流 = **进度推进快 10%**;
+--     · 而**对外给出的"剩余时间" = 剩余进度 ÷ 当前速率**。
+--   → 窗口内: 进度每秒 -1.1, 剩余时间 = 进度/1.1 → **每秒 -1.0** ✓
+--     (加速被除法抵消 —— 这就是历次把它误判成"没加速/不逐帧"的根源)
+--   → 窗口过期: 速率 1.1→1.0, **同一份进度除以更小的数** → 剩余时间**跳升** ✓
+--   → 手算核对(#12→#13): `12.1 →(过期)→ 12.3` = (12.1-0.3)×1.1-0.7 ≈ 12.28 ✓
+--   实现: 不引入"进度"变量, 而在**窗口状态切换的那一帧**按 factor 换算剩余
+--        (开窗 ÷factor, 过期 ×factor —— **对称**, 所以反复开关也不会累积偏差)。
+--   ⚠️ 这同时推翻了 v1.36.17 的"每周期只折一次"锁: 单向折算必然漂, 必须成对。
 local flowRankRetryAt = 0   -- 心流天赋重算的限流时间戳 (登录时天赋数据未就绪 -> 补算用)
+
 local function TickFlowAcceleration()
-    if (flowState.rank or 0) <= 0 then
-        lastFlowTick = 0
-        return
-    end
-    local now = GetTime()
-    if lastFlowTick == 0 then
-        lastFlowTick = now
-        return
-    end
-    local dt = now - lastFlowTick
-    lastFlowTick = now
-    if dt <= 0 then return end
-    if dt > 3 then return end           -- 读条/加载导致的异常 dt: 本轮跳过, 下轮自然接上
-    if flowUntil <= now then return end -- 窗口已过期, 不加速
-    local delta = dt * FLOW_RATE_PER_RANK * flowState.rank
-    -- v1.32.10 恢复: 绿喷充能**确实吃心流加速** (Wiki 铁证见 DREAM_BREATH_CHARGE_BASE 处)。
-    --   v1.32.9 曾把它整个删掉(当时误信"绿喷固定30s不受影响"), 属于把作用范围砍错了 ——
-    --   老板实机"还是对不上"后回查 Wiki 才确认。
-    --   充能速度 ×1.1 = nextChargeAt 每帧前移 dt×10%; 只在"未满层且时钟在走"时积分
-    --   (满层时游戏端充能本就停住, 加了会多减)。
-    if chargeModel.currentCharges ~= nil
-       and chargeModel.currentCharges < chargeModel.maxCharges
-       and chargeModel.nextChargeAt then
-        local ok1 = pcall(function()
-            chargeModel.nextChargeAt = chargeModel.nextChargeAt - delta
-        end)
-        if not ok1 and not flowTickErr1 then
-            flowTickErr1 = true
-            Trace("心流加速: 绿喷充能积分失败(疑似secret污染), 已跳过")
-        end
-    end
-    -- 静滞CD: 仅 ARMED/COOLDOWN 且仍在倒计时才加速
-    if (stasisState.phase == "ARMED" or stasisState.phase == "COOLDOWN")
-       and stasisState.cooldownEndTime and stasisState.cooldownEndTime > now then
-        local ok2 = pcall(function()
-            stasisState.cooldownEndTime = stasisState.cooldownEndTime - delta
-        end)
-        if not ok2 and not flowTickErr2 then
-            flowTickErr2 = true
-            Trace("心流加速: 静滞CD积分失败(疑似secret污染), 已跳过")
-        end
-    end
+    -- v1.36.32: 本函数只负责"窗口**过期**"这一侧 —— 开窗已在 OnFlowWindowRefresh **当场**换算。
+    --   过期没有对应的游戏事件可挂, 只能每帧检测(延迟 ≤1 帧 ≈16ms, 可忽略)。
+    if not flowWasActive then return end
+    local rank = flowState.rank or 0
+    if rank > 0 and flowUntil > GetTime() then return end    -- 窗口还开着 -> 不动
+    flowWasActive = false
+    local factor = 1 + FLOW_RATE_PER_RANK * rank
+    if factor > 0 then FlowConvertRemaining(factor) end
 end
 
 -- 重算心流状态层数缓存 (登录/天赋/专精变化时调用)
@@ -1270,8 +1389,12 @@ local function OnStasisStore()
     stasisState.storedTemporalAnomalies = 0  -- 重置溜溜球计数 (v1.20)
     stasisState.storedSpellIDs = {}  -- v1.34: 清空"已存技能"图标列表 (大图标排下帧显示空槽位)
     stasisState.thirdCastStartTime = 0  -- v1.25: 重置第3技能施法开始时刻 (防跨轮残留旧值, 瞬发第3技能时CD锚定错误)
+    stasisState.cdAnchoredAt = 0        -- v1.36.13: 同步重置锚点记录 (防跨轮残留旧值污染诊断)
     stasisState.innerfireEndTime = GetTime() + STASIS_OPENING_TOTAL_DURATION  -- 心火15s独立倒计时
     Trace("静滞激活 370537 -> STORING (存3技能, 未进CD)")
+    -- v1.36.36: 静滞的三次状态变迁也进"记账流水" —— 战斗中 /DBSH charge//DBSH next 能直接核对
+    --   起算时刻与时长(90 / 81.8), 否则只能靠 Trace(那条通道不进流水, 战斗中无法自证)。
+    ChargeDiag("静滞激活 -> 存储中(未进CD)")
     -- 激活时也重置计数器 (新一轮)
     usageCounter.used = 0
     usageCounter.stasisCDEndTime = 0
@@ -1303,9 +1426,33 @@ local function OnStasisArmed()
     else
         cdStart = cdStart + STASIS_CD_START_OFFSET
     end
-    stasisState.cooldownEndTime = cdStart + STASIS_COOLDOWN_DURATION
+    -- ⛔ 【v1.36.33 推翻本条】旧结论"起算时不折算"(v1.36.15)**已作废**:
+    --   它的论据是"01:08 起算时窗口开着(flowUntil > cdStart), 游戏 duration 仍 90" ——
+    --   但那次 API 明写 `rate=1.000`, **窗口根本没开**; 而 `flowUntil > cdStart` 只说明"窗口**结束**晚于起算",
+    --   完全可能是"起算**之后**才开窗" → 论据不成立。正确定性见下方 v1.36.33 注释。
+    --   （仍成立的结论: **不逐帧加速** —— 改为"窗口状态变化时按比值换算"）
+    -- v1.36.33 🔴 **起算那一刻若心流窗口确实已经开着 → 按当前 rate 折算总时长**(90 → 81.8)。
+    --   02:51 实测铁证: 老板连续放技能 → 我们起算那一刻窗口**已经开着**(buff 还剩 9.7s),
+    --   而模型写死 90, 游戏却是 81.8 → **整整偏慢 8.2s**(红灯晚亮)。流水: #5 起 API=81.1 / 模型=90.6, 差恒 +9.5s。
+    --   ⚠️ 判据必须精确到"**起算那一刻**窗口是否已开": `flowUntil - FLOW_WINDOW <= cdStart < flowUntil`。
+    --      · v1.36.12 曾只判 `flowUntil > cdStart`(窗口**结束**晚于起算) → 把"起算**之后**才开窗"也误判成"起算时已开"
+    --        而多折一次(模型偏快, 危险方向);
+    --      · v1.36.15 据此回滚成"起算不折" —— 但**那次实测的 rate 是 1.000, 窗口根本就没开**,
+    --        论据本身是误读。两条路现在的分工: 起算时已开 → 这里折; 起算后才开 → OnFlowWindowRefresh 换算。
+    local durStasis = STASIS_COOLDOWN_DURATION
+    local fRankStasis = flowState.rank or 0
+    if fRankStasis > 0 and flowUntil > cdStart and (flowUntil - FLOW_WINDOW) <= cdStart then
+        durStasis = durStasis / (1 + FLOW_RATE_PER_RANK * fRankStasis)
+    end
+    stasisState.cooldownEndTime = cdStart + durStasis
+    stasisState.cdAnchoredAt = cdStart   -- v1.36.11: 记下本轮实际锚点, 供 /DBSH charge 与游戏 startTime 对比
     Trace(string.format("静滞存满3技能(按钮高亮) -> ARMED, 90sCD锚定施法开始+1.3s, 结束于%.0fs(提前%.1fs)",
         stasisState.cooldownEndTime, GetTime() - cdStart))
+    -- v1.36.36: 这行是"静滞 CD 到底算多少"的唯一自证 —— 直接打出**实际采用的时长**与是否折算。
+    --   战斗中读不到游戏的 startTime/duration, 所以只能靠它留下证据(90.0 = 没折 / 81.8 = 折了)。
+    ChargeDiag(string.format("静滞存满 -> 起算CD %.2fs%s (锚=第3技能开始+%.1fs, 模型剩余%.1fs)",
+        durStasis, (durStasis < STASIS_COOLDOWN_DURATION - 0.01) and " [已折算心流]" or "",
+        STASIS_CD_START_OFFSET, stasisState.cooldownEndTime - GetTime()))
     -- 新CD开始, 重置计数器
     usageCounter.used = 0
     usageCounter.stasisCDEndTime = stasisState.cooldownEndTime
@@ -1344,6 +1491,9 @@ local function OnStasisRelease()
     stasisState.stasisReleaseTime = GetTime()  -- v1.20: 记录释放时刻, 去重用
     Trace(string.format("静滞释放(370537二次按下) -> COOLDOWN (CD结束于%.0fs)",
         stasisState.cooldownEndTime))
+    -- v1.36.36: 释放也留一条 —— 这样一轮静滞在流水里能看到完整三件套
+    --   (激活 -> 存满起算 -> 释放), 战斗中可核对"起算时刻/时长/释放时刻"是否与体感一致。
+    ChargeDiag(string.format("静滞释放 -> CD继续, 模型剩余%.1fs", stasisState.cooldownEndTime - GetTime()))
 end
 
 -- 更新静滞状态 (v1.14 核心重构: 用 IsUsableSpell 布尔信号驱动, 完全放弃 aura)
@@ -1431,8 +1581,125 @@ local function UpdateUsageCounter(dreamInfo, stasisInfo)
     end
 end
 
+-- v1.36.6: 静滞 CD —— API 可读时校准 (补上绿喷同款的"对齐官方值")
+-- 【作用】只要 `C_Spell.GetSpellCooldown` 读得到**非 secret** 的剩余秒, 就用官方值覆盖模型。
+-- 【定位 = 安全网, 不是主算法】战斗中时间值是 secret → `IsSafeNumber` 判否 → **自动跳过**;
+--   战斗内准确性完全由本地模型负责(v1.36.17 的折算模型), 这里只负责"读得到时清零残余误差"。
+-- 【v1.36.15 校正】下面这段旧注释里"静滞 CD 从按下激活就开始"**已作废**(是误读):
+--   静滞 CD 从"存满第 3 个技能(进 ARMED)"起算, 代码锚 `thirdCastStartTime + 1.3s` 正确;
+--   v1.36.6 当时以为的"+5.7s = 锚点晚"也不对 —— 真凶是"固定90s基准 + 窗口内逐帧积分"(v1.36.15 已修)。
+local lastStasisSyncAt = 0      -- v1.36.6: 静滞 CD 官方对齐的限流时间戳
+-- v1.36.7: 诊断采样期间**暂停**所有官方值校准 —— 否则会把模型的真实漂移抹平, 看不到机制差
+-- v1.36.26: ⚠️ **只赋值, 不写 local** —— 真实声明已前移到 SyncChargeModel 之前(约 452 行)。
+--   这里若再写 local 会创建**第二个变量**: 本函数(1504)捕获到新的, 而 SyncChargeModel(454)
+--   捕获到的还是旧的那个 → 绿喷的守卫静默失效(正是老板发现的"脱战永远测不出差异")。
+probeSuspendSync = false
+
+local function SyncStasisCooldownFromAPI()
+    if probeSuspendSync then return false end
+    if not (C_Spell and C_Spell.GetSpellCooldown) then return false end
+    -- v1.36.18: 放宽到 ARMED —— 静滞 CD 从"存满进 ARMED"就在跑, 只认 COOLDOWN 会整整漏掉一个阶段。
+    --   (ARMED 期间 API 若不可读/为 secret, 下面的 IsSafeNumber 会挡住 → 放宽是安全的)
+    if stasisState.phase ~= "COOLDOWN" and stasisState.phase ~= "ARMED" then return false end
+    local ok, cd = pcall(C_Spell.GetSpellCooldown, STASIS_SPELL_ID)
+    if not ok or type(cd) ~= "table" then return false end
+    local rem = cd.timeUntilEndOfStartRecovery
+    if not IsSafeNumber(rem) or rem <= 0 then return false end
+    local before = (stasisState.cooldownEndTime or 0) - GetTime()
+    stasisState.cooldownEndTime = GetTime() + rem
+    -- 只在"纠正量明显"时写记账流水(ring 20 条, 仍别把有用的施放/静滞记录挤掉)
+    if math.abs(before - rem) > 0.5 then
+        ChargeDiag(string.format("静滞CD校准(API官方剩余): %.1fs -> %.1fs (模型原来偏%+.1fs)",
+            before, rem, before - rem))
+    end
+    return true
+end
+
 --==========================================================================
--- v1.33 引擎句柄 (DurationObject) — 战斗中显示零本地计算的官方通道
+-- v1.36.19 /DBSH track — 长时程(战斗+脱战)精度追踪
+--==========================================================================
+-- 【为什么这么做】战斗中引擎的**连续时间值**(剩余秒/充能秒)全是 secret, 读不到数字。
+--   但暴雪没加密**布尔信号**, 所以可以拿"状态翻转的真实时刻"当真值锚点:
+--     ① 绿喷**满层**:  C_Spell.GetSpellCharges(绿喷).isActive 由 true→false
+--     ② 静滞**CD结束**: C_Spell.IsSpellUsable(静滞) 由 false→true (仅在 COOLDOWN 阶段)
+--   把这两个事件的**真实发生时刻**与"模型在事件前一帧预测的时刻"相减 → 得到该时刻的误差。
+--   这样**战斗中也能量化模型精度**(不必等脱战读 API)。
+-- 【局限(要跟老板说清)】绿喷只能捕捉"满 2 层"这一跳(1 层时 isActive 仍为 true, 无翻转);
+--   静滞只能捕捉"CD 结束"。所以是**离散锚点对比**, 不是连续曲线。
+--==========================================================================
+local trackOn, trackStart, trackLog = false, 0, {}
+local trackPrevPredCharge, trackPrevPredStasis = nil, nil
+local trackPrevChargesActive, trackPrevStasisUsable = nil, nil
+-- v1.36.21: 信号可读性统计 —— 用来回答"为什么没捕捉到锚点"(是没发生? 还是信号读不到?)
+local trackStat = {}
+local function TrackStatReset()
+    trackStat = { chCN = 0, chCO = 0, chPN = 0, chPO = 0,   -- 绿喷 isActive: 战斗/脱战 × 读不到/可读
+                  suCN = 0, suCO = 0, suPN = 0, suPO = 0,   -- 静滞 IsSpellUsable: 同上
+                  phase = {} }
+end
+TrackStatReset()
+
+local function TrackReset()
+    trackOn, trackStart, trackLog = false, 0, {}
+    trackPrevPredCharge, trackPrevPredStasis = nil, nil
+    trackPrevChargesActive, trackPrevStasisUsable = nil, nil
+    TrackStatReset()
+end
+
+-- 每帧调用: 检测布尔翻转 -> 记一条锚点
+local function TrackTick()
+    if not trackOn then return end
+    local now = GetTime()
+    local inCombat = (UnitAffectingCombat and UnitAffectingCombat("player")) and true or false
+    local flowOpen = (flowUntil > now)
+
+    -- ① 绿喷满层 (isActive: true -> false)
+    local isActive = nil
+    pcall(function()
+        local ch = C_Spell and C_Spell.GetSpellCharges and C_Spell.GetSpellCharges(DREAM_BREATH_SPELL_ID)
+        if type(ch) == "table" then
+            local v = ch.isActive
+            if not (issecretvalue and issecretvalue(v)) then isActive = v end
+        end
+    end)
+    if trackPrevChargesActive == true and isActive == false and trackPrevPredCharge then
+        trackLog[#trackLog + 1] = { kind = "绿喷满层", at = now, pred = trackPrevPredCharge,
+            diff = trackPrevPredCharge - now, combat = inCombat, flow = flowOpen }
+    end
+    trackPrevChargesActive = isActive
+
+    -- ② 静滞 CD 结束 (IsSpellUsable: false -> true, 仅 COOLDOWN 阶段)
+    local usable = nil
+    pcall(function()
+        if C_Spell and C_Spell.IsSpellUsable then
+            local u = C_Spell.IsSpellUsable(STASIS_SPELL_ID)
+            if not (issecretvalue and issecretvalue(u)) then usable = u and true or false end
+        end
+    end)
+    if stasisState.phase == "COOLDOWN" and trackPrevStasisUsable == false and usable == true
+       and trackPrevPredStasis then
+        trackLog[#trackLog + 1] = { kind = "静滞CD好", at = now, pred = trackPrevPredStasis,
+            diff = trackPrevPredStasis - now, combat = inCombat, flow = flowOpen }
+    end
+    trackPrevStasisUsable = usable
+
+    -- v1.36.21: 统计信号可读性(定性"没锚点"的原因)
+    if inCombat then
+        if isActive == nil then trackStat.chCN = trackStat.chCN + 1 else trackStat.chCO = trackStat.chCO + 1 end
+        if usable == nil then trackStat.suCN = trackStat.suCN + 1 else trackStat.suCO = trackStat.suCO + 1 end
+    else
+        if isActive == nil then trackStat.chPN = trackStat.chPN + 1 else trackStat.chPO = trackStat.chPO + 1 end
+        if usable == nil then trackStat.suPN = trackStat.suPN + 1 else trackStat.suPO = trackStat.suPO + 1 end
+    end
+    trackStat.phase[stasisState.phase or "?"] = (trackStat.phase[stasisState.phase or "?"] or 0) + 1
+
+    -- 帧末缓存(给下一帧的对比用 —— 本帧模型可能已结算过, 所以取上一帧的值)
+    trackPrevPredCharge = chargeModel.nextChargeAt
+    trackPrevPredStasis = stasisState.cooldownEndTime
+end
+
+--==========================================================================
+-- v1.33 引擎句柄 (DurationObject) — 战斗中零本地计算的官方通道
 --==========================================================================
 -- 【背景】战斗中暴雪把冷却/充能的时间数字全部加密(secret), 没有任何 API 能
 --   读到普通数字 —— 冷却管理器(CooldownViewer)也一样: 它的
@@ -1606,6 +1873,65 @@ local function OnDreamBreathCast(spellID)
     Trace(string.format("绿喷施放 spellID=%s (模型扣层), 累计=%d", tostring(spellID), usageCounter.used))
 end
 
+--==========================================================================
+-- v1.36.1 探针: 蓄力(empower)施法事件原始参数
+--   背景: 老板反馈"绿喷蓄力被取消, 本地模型仍算作释放(扣层/计数)"。
+--   改逻辑之前先拿真机数据, 要看清三件事:
+--     ① 取消时游戏到底发不发 SUCCEEDED(绿喷) —— 发, 就是误判源头;
+--     ② EMPOWER_STOP 的 complete 标志在战斗中能否读到 (还是 secret);
+--     ③ 事件能否用 castGUID / castBarID 配对 (官方标注 castBarID 为 NeverSecret)。
+--   只记录, 不参与任何业务判断; 用 /DBSH cast 打印。
+--   所有参数读取都包 pcall —— secret 值参与 tostring/比较会抛错。
+--==========================================================================
+local CAST_PROBE_MAX = 40
+local castProbe = {}
+
+-- v1.36.2: 探针/帮助里显示的版本号从插件元数据读 —— 避免"代码已升级、文案没跟"的误会
+--   (上一次就是这个坑: 探针标题硬写 v1.36.1, 实际跑的已是 v1.36.2)
+local ADDON_VERSION = "?"
+pcall(function()
+    if C_AddOns and C_AddOns.GetAddOnMetadata then
+        ADDON_VERSION = C_AddOns.GetAddOnMetadata(AddonName, "Version") or "?"
+    elseif GetAddOnMetadata then
+        ADDON_VERSION = GetAddOnMetadata(AddonName, "Version") or "?"
+    end
+end)
+
+local function CastProbeArgDesc(v)
+    local ok, s = pcall(function()
+        if issecretvalue and issecretvalue(v) then return "secret" end
+        local t = type(v)
+        if t == "string" then return "str=" .. v end
+        if t == "number" then return "num=" .. tostring(v) end
+        if t == "boolean" then return "bool=" .. tostring(v) end
+        if t == "nil" then return "nil" end
+        return t
+    end)
+    if not ok then return "<读参数抛错>" end
+    return s
+end
+
+-- 记录一条事件 (先把 args 存表 —— 存 secret 是安全的, 比较/算术才抛错)
+local function CastProbeLog(event, ...)
+    local n = select("#", ...)
+    local args = { ... }
+    local ok = pcall(function()
+        local parts = {}
+        for i = 1, n do
+            parts[#parts + 1] = string.format("a%d[%s]", i, CastProbeArgDesc(args[i]))
+        end
+        castProbe[#castProbe + 1] = string.format("[%.1fs] %-30s %s | 模型层=%s/%s used=%s",
+            GetTime(), event, table.concat(parts, " "),
+            tostring(chargeModel.currentCharges), tostring(chargeModel.maxCharges),
+            tostring(usageCounter.used))
+        if #castProbe > CAST_PROBE_MAX then table.remove(castProbe, 1) end
+    end)
+    if not ok then
+        castProbe[#castProbe + 1] = string.format("[%.1fs] %-30s <记录异常>", GetTime(), event)
+        if #castProbe > CAST_PROBE_MAX then table.remove(castProbe, 1) end
+    end
+end
+
 -- 消费队列的一个技能 (FIFO): 头部弹出, openingLastIndex++
 -- 只有队列还有对应类型的技能时才消耗
 local function ConsumeQueueItem(itemType)
@@ -1721,7 +2047,10 @@ local function EvaluateState()
     -- 战斗中: 完全信任本地状态机 (施法序列 370537/370564 + 本地90s计时)
     --   因为战斗中 GetSpellCooldown 是 secret number, actualRem 必为 nil,
     --   旧逻辑会跳过校验 → 锁死 READY → 显示"静滞好了"但实际还在冷却 (核心bug)
-    if phase == "READY" and not InCombatLockdown() then
+    -- v1.36.26: + `not probeSuspendSync` —— 这条也是"脱战自动取系统值"的路径, 且在 EvaluateState 里每帧跑。
+    --   它的触发条件恰好是「模型认为 CD 好了、官方说还在 CD」= **模型偏快(危险方向)**,
+    --   不拦住的话, 最该被抓到的偏差会被它当场抹平。(老板 2026-09-21 指出"脱战永远测不出差异")
+    if phase == "READY" and not InCombatLockdown() and not probeSuspendSync then
         local realCD = GetSpellCooldownInfo(STASIS_SPELL_ID)
         local actualRem = (realCD and not realCD.secret) and realCD.remaining or nil
         if actualRem and actualRem > 1.5 then
@@ -2411,6 +2740,13 @@ FSH:RegisterEvent("PLAYER_REGEN_ENABLED")   -- 出战斗: 校准绿喷充能模�
 FSH:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 FSH:RegisterEvent("UNIT_SPELLCAST_START")  -- 记录第3技能施法开始时刻 (静滞90sCD的起算锚点)
 
+-- v1.36.1 探针: 蓄力相关事件全量监听 (只为诊断, 不参与业务逻辑; 见 CastProbeLog)
+FSH:RegisterEvent("UNIT_SPELLCAST_EMPOWER_START")
+FSH:RegisterEvent("UNIT_SPELLCAST_EMPOWER_STOP")
+FSH:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
+FSH:RegisterEvent("UNIT_SPELLCAST_FAILED")
+FSH:RegisterEvent("UNIT_SPELLCAST_STOP")
+
 -- 高频刷新: 每帧调一次 (WoW 默认 ~60fps, 文字立即更新)
 -- 用 pcall 防异常吞噬后续刷新 (这是过去 "CD卡死"的根因之一)
 -- 前向声明: UpdateConfigDrag / CreateConfigPanel 定义在文件后面, 但闭包(OnUpdate/OnEvent/C_Timer)
@@ -2422,6 +2758,12 @@ FSH:SetScript("OnUpdate", function(self, elapsed)
     UpdateConfigDrag()
     -- v1.32.5: 心流加速按真实时间积分 (独立于 UI 开关, 关掉UI时计时依然准确)
     pcall(TickFlowAcceleration)
+    pcall(TrackTick)   -- v1.36.19: 长时程追踪(未开启时立即返回, 开销可忽略)
+    -- v1.36.6: 静滞 CD 定期对齐官方剩余 (限流 2s; 战斗中值加密 / 不在 ARMED·COOLDOWN 时函数内部自己跳过)
+    if GetTime() - lastStasisSyncAt > 2 then
+        lastStasisSyncAt = GetTime()
+        pcall(SyncStasisCooldownFromAPI)
+    end
     if not db or not db.enabled then return end
     local ok, err = pcall(UpdateUI)
     if not ok and not FSH._updateErrored then
@@ -2446,7 +2788,131 @@ local function StartFallbackTimer()
     end)
 end
 
+--==========================================================================
+-- v1.36.2: 蓄力施法"取消回滚" —— 修"蓄力取消仍被算作释放"
+--   真机数据 (2026-09-20 老板探针流水): 绿喷蓄力时游戏发事件的顺序是
+--     EMPOWER_START(bar=N) -> SUCCEEDED(355936) -> EMPOWER_STOP(bar=N, complete=false/true)
+--   即 **SUCCEEDED 在"开始蓄力"那一刻就发了, 取消也照发** —— 这就是误扣层的根因
+--   (v1.29 把施放检测从 EMPOWER_STOP 挪到 SUCCEEDED 时并不知道这一点)。
+--   而 EMPOWER_STOP 的 `complete` 是 clean 布尔(false=取消/true=真放出去), spellID 也是明文,
+--   castBarID 官方标注 NeverSecret —— 三者可用来精确判定 + 配对。
+--
+--   方案: **乐观记账 + 取消回滚** —— SUCCEEDED 时照旧立刻扣层/计数/开窗(保证层数实时、
+--   充能计时不变、对真实施放零回归), 同时存一份快照; 若随后收到 complete=false 的
+--   EMPOWER_STOP, 就把这些状态原样恢复。
+--   读不到 complete(某些场景可能被加密)时按"已放出"处理 = 保守, 不会比修前更差。
+--==========================================================================
+local EMPOWER_STOP_WINDOW = 3.0     -- SUCCEEDED 之后等 STOP 的窗口(秒), 超时不再回滚
+local empowerPending = nil          -- { spellID, bar, t, snap }
+local lastEmpowerBar = nil          -- 最近一次 EMPOWER_START 的 castBarID
+local lastEmpowerSpell = nil
+local empowerRollbackCount = 0      -- 回滚次数 (诊断/测试用)
+
+local function EmpowerSnapshot()
+    local st = stasisState or {}
+    local list = st.storedSpellIDs
+    return {
+        charges      = chargeModel.currentCharges,
+        nextChargeAt = chargeModel.nextChargeAt,
+        used         = usageCounter.used,
+        lastIndex    = openingLastIndex,
+        flowUntil    = flowUntil,
+        phase        = st.phase,
+        storedCount  = st.storedCount,
+        storedN      = list and #list or 0,
+        thirdCast    = st.thirdCastStartTime,
+        anomalies    = st.storedTemporalAnomalies,
+    }
+end
+
+local function EmpowerRollback(pending, spID, barID)
+    if not pending or not pending.snap then return end
+    local s = pending.snap
+    local dt = GetTime() - (pending.t or GetTime())
+    local hadCharges, hadUsed = chargeModel.currentCharges, usageCounter.used
+    -- 1) 层数 / 充能时钟 / 已用计数 / 队列游标 / 心流窗口
+    chargeModel.currentCharges = s.charges
+    chargeModel.nextChargeAt = s.nextChargeAt
+    usageCounter.used = s.used
+    openingLastIndex = s.lastIndex
+    flowUntil = s.flowUntil
+    -- 2) 静滞存储: 绿喷在白名单里, 取消不该占一个存入位
+    local st = stasisState
+    if st and st.storedCount ~= s.storedCount then
+        st.storedCount = s.storedCount
+        local list = st.storedSpellIDs
+        while list and #list > s.storedN do table.remove(list) end
+        st.thirdCastStartTime = s.thirdCast
+        st.storedTemporalAnomalies = s.anomalies
+        if UpdateStoredIcons then UpdateStoredIcons() end
+        if st.phase ~= s.phase then
+            -- 极罕见: 取消的这次刚好是"第3个", 状态机已推进 —— 不撤状态机, 只留痕
+            ChargeDiag(string.format("!! 蓄力取消回滚: 存满推进已发生(%s->%s), 未撤状态机",
+                tostring(s.phase), tostring(st.phase)))
+        end
+    end
+    empowerRollbackCount = empowerRollbackCount + 1
+    ChargeDiag(string.format("绿喷蓄力取消 -> 已回滚(未扣层) spellID=%s bar=%s 距SUCCEEDED %.2fs: 层 %s -> %s(已恢复), used %s -> %s(已恢复)",
+        tostring(spID), tostring(barID), dt,
+        tostring(hadCharges), tostring(chargeModel.currentCharges),
+        tostring(hadUsed), tostring(usageCounter.used)))
+end
+
 FSH:SetScript("OnEvent", function(self, event, ...)
+    -- v1.36.1 探针: 先原样记一条 (只读, 不改任何状态); 报错也不影响下面业务逻辑
+    if event == "UNIT_SPELLCAST_SUCCEEDED" or event == "UNIT_SPELLCAST_EMPOWER_START"
+       or event == "UNIT_SPELLCAST_EMPOWER_STOP" or event == "UNIT_SPELLCAST_INTERRUPTED"
+       or event == "UNIT_SPELLCAST_FAILED" or event == "UNIT_SPELLCAST_STOP" then
+        local u = select(1, ...)
+        local okU, isPlayer = pcall(function() return u == "player" end)
+        if (not okU) or isPlayer then CastProbeLog(event, ...) end
+    end
+
+    -- v1.36.2: 蓄力取消回滚 —— START 记 castBarID(用于和 STOP 配对); STOP 按 complete 判定
+    if event == "UNIT_SPELLCAST_EMPOWER_START" then
+        local a1, a2, a3, a4 = ...
+        pcall(function()
+            lastEmpowerSpell = a3
+            lastEmpowerBar = a4
+            -- 上一个 pending 超时没等到 STOP -> 视为已放出, 丢弃快照
+            if empowerPending and (GetTime() - (empowerPending.t or 0)) > EMPOWER_STOP_WINDOW then
+                -- v1.36.31 兜底: 开窗已移到 STOP 分支, 万一 STOP 没到, 这里**补开窗**
+                --   (否则这一次的心流窗口会整场漏掉 -> 后续折算全失效)
+                pcall(OnFlowWindowRefresh)
+                empowerPending = nil
+            end
+        end)
+        return
+    elseif event == "UNIT_SPELLCAST_EMPOWER_STOP" then
+        local a1, a2, a3, a4, a5, a6 = ...
+        local spID, complete, barID = a3, a4, a6
+        local pending = empowerPending
+        if pending then
+            local recent = pending.t and (GetTime() - pending.t) <= EMPOWER_STOP_WINDOW
+            local matched = false
+            local okM = pcall(function()
+                if barID ~= nil and pending.bar ~= nil then
+                    matched = (barID == pending.bar)      -- 优先 castBarID 精确配对
+                else
+                    matched = (spID == pending.spellID)
+                end
+            end)
+            if recent and okM and matched then
+                local cancelled = false
+                local okC = pcall(function() cancelled = (complete == false) end)
+                if okC and cancelled then
+                    EmpowerRollback(pending, spID, barID)
+                else
+                    -- v1.36.31: **这才是开窗时机** —— `complete=true`(读不到时也按"已放出"处理) 才开窗,
+                    --   与游戏的"心流 buff 上身时刻"对齐(窗口比原来晚约 1 秒, 修掉"边界少折一层")。
+                    pcall(OnFlowWindowRefresh)
+                end
+                empowerPending = nil
+            end
+        end
+        return
+    end
+
     if event == "ADDON_LOADED" then
         local loaded = ...
         if loaded == AddonName then
@@ -2531,6 +2997,8 @@ FSH:SetScript("OnEvent", function(self, event, ...)
             SyncChargeModel(info)
             Trace(string.format("出战斗校准绿喷: 层数=%s/%s", tostring(chargeModel.currentCharges), tostring(chargeModel.maxCharges)))
         end
+        -- v1.36.6: 静滞 CD 也趁机对齐官方剩余 (这是判断里的 T, 偏了就会红灯晚亮)
+        SyncStasisCooldownFromAPI()
         if db then UpdateUI() end
         return
     end
@@ -2538,10 +3006,17 @@ FSH:SetScript("OnEvent", function(self, event, ...)
     if event == "SPELL_UPDATE_COOLDOWN" then
         EngineInvalidate()  -- v1.33: 充能/CD 状态可能变化, 引擎句柄下帧重取
         -- 充能/CD 变化: 若 API 可读(出战斗), 趁机校准绿喷充能模型
-        local ok, info = pcall(function() return GetSpellChargeInfo(DREAM_BREATH_SPELL_ID) end)
-        if ok and info and not info.secret then
-            SyncChargeModel(info)
+        -- v1.36.14: 诊断采样期间**同样暂停绿喷校准** —— 否则 API 会实时把模型拉平,
+        --   测出来的"差 0.00s"是校准的功劳, 不是模型算法准。2026-09-21 01:08 实测踩到:
+        --   窗口开着时模型 Δ 仍显示 -1.0(理论上该 -1.1), 就是被这里持续覆盖的。
+        if not probeSuspendSync then
+            local ok, info = pcall(function() return GetSpellChargeInfo(DREAM_BREATH_SPELL_ID) end)
+            if ok and info and not info.secret then
+                SyncChargeModel(info)
+            end
         end
+        -- v1.36.6: 静滞 CD 同步对齐 (不可读时函数内部自己跳过)
+        SyncStasisCooldownFromAPI()
         if db then UpdateUI() end
         return
     end
@@ -2607,17 +3082,25 @@ FSH:SetScript("OnEvent", function(self, event, ...)
         -- v1.32: 蓄力技能统一判断一次 (绿喷/红喷), 供下面心流移位用
         local isEmpowerCast = spellId and EMPOWER_SPELL_IDS[spellId]
 
-        -- v1.29: 绿喷施放检测移到 SUCCEEDED (原在 EMPOWER_STOP, 但12.1战斗中 EMPOWER_STOP
-        --   参数被加密只透出 unit, spellId=complete=nil, 导致绿喷计数/扣层/队列消费全失效)
-        if DREAM_BREATH_IDS[spellId] then
-            OnDreamBreathCast(spellId)
-            ConsumeQueueItem("DREAM_BREATH")
+        -- v1.36.2: 蓄力技能先存一份状态快照 —— 随后若收到 EMPOWER_STOP(complete=false)
+        --   说明这次蓄力被取消, 把下面乐观扣掉的东西原样回滚 (见 EmpowerRollback)
+        if isEmpowerCast then
+            empowerPending = {
+                spellID = spellId,
+                bar     = lastEmpowerBar,
+                t       = GetTime(),
+                snap    = EmpowerSnapshot(),
+            }
         end
 
-        -- v1.32.5: 任意蓄力技能施放成功 -> 只"开窗/刷新窗口";
-        --   真正的冷却加速由 TickFlowAcceleration 逐帧积分 (见心流状态段注释)
-        --   绿喷本身也在 EMPOWER_SPELL_IDS 里, 统一在这里开窗一次, 不重复;
-        --   红喷(357208/382266)不扣层不计数, 只开窗
+        -- v1.36.31 🔴 **开窗时机修正: 从"按下蓄力"(SUCCEEDED) 延后到"释放确认"(EMPOWER_STOP complete=true)** ——
+        --   原因(2026-09-21 02:26 老板实测): 心流 buff 是**蓄力完成**才给的, 而我们在**按下那一刻**就开窗
+        --   → 窗口比真实 buff **早约 1 秒**。后果不止"早 1 秒": 在"窗口刚好过期"的边界上,
+        --   游戏认为窗口还开着(新层按 27.27 折), 我们的窗口已关 → **少折一层 → 模型偏慢 2.7s**。
+        --   铁证: `脱战对账 模型1层/20.0s vs API1层/17.4s 差+2.6s` —— 20.0=起算30, 17.4≈起算27.27。
+        --   顺带好处: 取消蓄力(complete=false)时**不会再误开窗**(以前要先开窗再回滚, 采样会抓到中间态)。
+        --   兜底: STOP 万一没到(START 时发现上一个 pending 超时), 在 START 分支补开窗(见下)。
+        --   ⚠️ 这里**只保留"补算 rank"** —— 扣层(OnDreamBreathCast)仍要用 rank 才能算折算。
         if isEmpowerCast then
             -- v1.32.5 兜底: 登录/进世界时天赋数据常常还没就绪, RefreshFlowStateRank 会读到 0,
             --   导致心流整场静默失效 (表现: 游戏里绿喷已被加速, 插件却按原速倒计时 -> "CD 对不上")。
@@ -2629,7 +3112,17 @@ FSH:SetScript("OnEvent", function(self, event, ...)
                     RefreshFlowStateRank()
                 end
             end
-            OnFlowWindowRefresh()
+            -- v1.36.31: 开窗**已移除** (改到 EMPOWER_STOP 分支)。这里不再调 OnFlowWindowRefresh。
+        end
+
+        -- v1.29: 绿喷施放检测移到 SUCCEEDED (原在 EMPOWER_STOP, 但12.1战斗中 EMPOWER_STOP
+        --   参数被加密只透出 unit, spellId=complete=nil, 导致绿喷计数/扣层/队列消费全失效)
+        -- v1.36.31: 扣层仍在 SUCCEEDED(乐观记账, 保证层数显示实时); 但**心流窗口不再在这里开**
+        --   (延后到 EMPOWER_STOP 的"释放确认")。效果 = 连续施放时用上一轮窗口折、隔久了则等 STOP 开窗后折剩余,
+        --   两条路都与游戏"按起算时的真实 rate"等价。
+        if DREAM_BREATH_IDS[spellId] then
+            OnDreamBreathCast(spellId)
+            ConsumeQueueItem("DREAM_BREATH")
         end
 
         -- v1.15 核心: STORING 阶段数白名单治疗技能, 存满3个 -> ARMED (进90s CD)
@@ -2708,6 +3201,10 @@ local function PrintHelp()
     print("|cFF7F77DD/DBSH charge|r   - 绿喷充能诊断(**脱战后敲**: API真值 vs 本地模型 + 【对账】差异 + 事件流水)")
     print("|cFF7F77DD/DBSH secret|r   - secret 字段探测(战斗中能读到什么: type/tostring/去密, 一次给结论)")
     print("|cFF7F77DD/DBSH talents|r  - 天赋树探针(API链路/各树节点/已点天赋名+spellID, 排查识别失败)")
+    print("|cFF7F77DD/DBSH cast|r     - 蓄力施法事件探针(查蓄力取消是否被误算成释放; 含当前版本号)")
+    print("|cFF7F77DD/DBSH track|r    - 长时程精度追踪(仅脱战段有效, 战斗中信号读不到)")
+    print("|cFF7F77DD/DBSH next|r     - 一行式模型值(战斗中随时敲, 与游戏技能栏人工对比)")
+    print("|cFF7F77DD/DBSH time|r     - 充能计时对账(**脱战+充能中**敲: 引擎剩余 vs 模型剩余, 连续采样给误差)")
     print("|cFF7F77DD/DBSH status|r   - 资格门槛检测状态(职业/专精/英雄天赋/静滞)")
     print("|cFF7F77DD别名|r: /DBSH  /绿喷管家  全部通用")
 end
@@ -3166,6 +3663,94 @@ SlashCmdList["DBSH"] = function(msg)
             for _, l in ipairs(allNodes) do print("  " .. l) end
         end)
         if not okP then print("|cFFFF0000[绿喷管家]|r 探针异常: " .. tostring(errP)) end
+    elseif cmd == "next" then
+        -- v1.36.22: 一行式"模型值" —— 战斗/脱战都能敲, 用来跟**游戏技能栏**做人工对比。
+        --   为什么需要: 战斗中引擎真值全是 secret, 插件读不到"系统值";
+        --   但**游戏技能栏上的倒计时是肉眼可见的** → "模型值 vs 技能栏"是战斗中唯一可行的验证手段。
+        local nowN = GetTime()
+        local chTxt
+        if chargeModel.currentCharges and chargeModel.nextChargeAt
+           and chargeModel.currentCharges < (chargeModel.maxCharges or 2) then
+            chTxt = string.format("%.1fs", math.max(0, chargeModel.nextChargeAt - nowN))
+        else
+            chTxt = "已满/无充能"
+        end
+        local stTxt
+        if (stasisState.phase == "ARMED" or stasisState.phase == "COOLDOWN")
+           and (stasisState.cooldownEndTime or 0) > nowN then
+            stTxt = string.format("%.1fs", stasisState.cooldownEndTime - nowN)
+        else
+            stTxt = "不在CD(" .. tostring(stasisState.phase) .. ")"
+        end
+        print(string.format("|cFF7F77DD[绿喷管家]|r 模型值: 绿喷下一层 |cFFFFFF00%s|r | 静滞CD |cFFFFFF00%s|r | 层 %s/%s | 心流 %s",
+            chTxt, stTxt, tostring(chargeModel.currentCharges), tostring(chargeModel.maxCharges),
+            ((flowState.rank or 0) > 0 and flowUntil > nowN)
+                and (tostring(flowState.rank) .. "层/窗口开") or "窗口关"))
+        print("  (对照: ① 游戏技能栏倒计时; ② 插件右上角'静滞CD Xs'=引擎真值渲染, 与上面模型值的差就是模型误差)")
+        -- v1.36.30: 附最近 3 条记账流水 —— **纯本地记录, 战斗中照常可用**。
+        --   这样一条命令就能同时看到"模型值"和"折算/回滚有没有真的发生"(不用再敲 /DBSH charge)。
+        --   战斗中这是验证"折算机制在战斗里生效"最直接的证据(引擎/API 值读不到, 但流水读得到)。
+        local ev = chargeDiag.events
+        local n = #ev
+        if n > 0 then
+            print("  --- 最近记账 (本地记录, 战斗中也能看) ---")
+            for i = math.max(1, n - 2), n do
+                print("    " .. tostring(ev[i]))
+            end
+        end
+    elseif cmd == "track" then
+        -- v1.36.19: 长时程追踪 (战斗+脱战) —— 用"布尔翻转的真实时刻"当锚点, 战斗中也能量化误差
+        if not trackOn then
+            TrackReset()
+            trackOn = true
+            trackStart = GetTime()
+            print("|cFF7F77DD[绿喷管家]|r 长时程追踪已开始 —— 去打吧")
+            print("  建议: 进战斗打 45s -> 脱战再打 45s, 中间不定期放红喷/绿喷续心流")
+            print("  再敲一次 |cFF7F77DD/DBSH track|r 结束并输出结果")
+        else
+            trackOn = false
+            local dur = GetTime() - trackStart
+            print(string.format("|cFF7F77DD[绿喷管家]|r 长时程追踪结果 (共 %.1fs, %d 个锚点)", dur, #trackLog))
+            if #trackLog == 0 then
+                print("  没捕捉到任何锚点 —— 检查: 绿喷有没有满过 2 层? 静滞有没有转完一轮 CD?")
+            end
+            print("  --- 明细 (差 = 模型预测时刻 - 真实时刻; 正=模型偏慢, 负=模型偏快[危险]) ---")
+            local sumC, nC, sumS, nS = 0, 0, 0, 0
+            local mnC, mxC, mnS, mxS = nil, nil, nil, nil
+            for _, e in ipairs(trackLog) do
+                print(string.format("    [%6.1fs] %-10s 引擎 t=%6.1f  模型预测 t=%6.1f  差 %+5.2fs   %s|心流%s",
+                    e.at - trackStart, e.kind, e.at, e.pred, e.diff,
+                    e.combat and "战斗" or "脱战", e.flow and "开" or "关"))
+                if e.kind == "绿喷满层" then
+                    nC = nC + 1; sumC = sumC + e.diff
+                    if mnC == nil or e.diff < mnC then mnC = e.diff end
+                    if mxC == nil or e.diff > mxC then mxC = e.diff end
+                else
+                    nS = nS + 1; sumS = sumS + e.diff
+                    if mnS == nil or e.diff < mnS then mnS = e.diff end
+                    if mxS == nil or e.diff > mxS then mxS = e.diff end
+                end
+            end
+            local function trackLine(tag, n, sum, mn, mx)
+                if n > 0 then
+                    print(string.format("  --- %s: %d 次 | 平均 %+.2fs | 范围 %+.2f ~ %+.2f", tag, n, sum / n, mn, mx))
+                else
+                    print(string.format("  --- %s: 0 次(没捕捉到)", tag))
+                end
+            end
+            trackLine("绿喷满层", nC, sumC, mnC, mxC)
+            trackLine("静滞CD好", nS, sumS, mnS, mxS)
+            -- v1.36.21: 信号可读性 —— 直接回答"为什么没锚点"(是没发生, 还是信号读不到?)
+            print("  --- 信号可读性 (帧计数) ---")
+            print(string.format("    绿喷 isActive:  战斗[可读 %d / 读不到 %d]   脱战[可读 %d / 读不到 %d]",
+                trackStat.chCO, trackStat.chCN, trackStat.chPO, trackStat.chPN))
+            print(string.format("    静滞 IsUsable:  战斗[可读 %d / 读不到 %d]   脱战[可读 %d / 读不到 %d]",
+                trackStat.suCO, trackStat.suCN, trackStat.suPO, trackStat.suPN))
+            local ph = {}
+            for k, v in pairs(trackStat.phase or {}) do ph[#ph + 1] = string.format("%s=%d", tostring(k), v) end
+            print("    静滞 phase 分布: " .. ((#ph > 0) and table.concat(ph, "  ") or "无"))
+            print("  判读: |差|<=1s 准 / 1~2s 可接受 / >3s 漂了; 重点看带'战斗'的行(那才是模型自己算的)")
+        end
     elseif cmd == "flow" then
         -- v1.32: 心流状态调试 (强制重算一次再显示)
         RefreshFlowStateRank()
@@ -3200,6 +3785,394 @@ SlashCmdList["DBSH"] = function(msg)
         if not okW2 then print("|cFFFF0000[绿喷管家]|r flow诊断2异常: " .. tostring(errW2)) end
         print("|cFF7F77DD[绿喷管家]|r 绿喷充能倒计时: " .. (chargeActive and "激活" or "未激活")
               .. ", 静滞CD倒计时: " .. (stasisActive and "激活" or "未激活"))
+        -- v1.36.9: 游戏侧 aura 探针 —— 能不能**直接读**到心流 buff 的剩余时间?
+        --   老板思路: 心流 buff 由绿喷/红喷"施法成功"刷新到 10s。现在模型靠"事件+10s"**推算**窗口;
+        --   若 aura 剩余在战斗中可读, 就能改用它驱动加速窗口 —— 漏刷/延迟都不怕, 长战斗里更准。
+        local okA, errA = pcall(function()
+            local nowA = GetTime()
+            print(string.format("|cFF7F77DD[绿喷管家]|r 加速窗口(模型推算): 剩余 %.1fs (flowUntil=%.1f)",
+                (flowUntil > nowA) and (flowUntil - nowA) or 0, flowUntil or 0))
+            if not (C_UnitAuras and C_UnitAuras.GetAuraDataByIndex) then
+                print("  C_UnitAuras.GetAuraDataByIndex 不可用, 读不到 aura")
+                return
+            end
+            -- v1.36.10: 两个 ID 都查 —— 真机已证 天赋ID(385696) != 光环ID(390148)
+            if C_UnitAuras.GetPlayerAuraBySpellID then
+                for _, idq in ipairs({ FLOW_STATE_ID, FLOW_AURA_ID }) do
+                    local ok1, d1 = pcall(C_UnitAuras.GetPlayerAuraBySpellID, idq)
+                    if ok1 and type(d1) == "table" then
+                        local rem = "?"
+                        pcall(function()
+                            if type(d1.expirationTime) == "number" and d1.expirationTime > 0 then
+                                rem = string.format("%.1fs", d1.expirationTime - nowA)
+                            end
+                        end)
+                        print(string.format("  直查 id=%s: 命中! name=%s dur=%s 剩余=%s 层数=%s",
+                            tostring(idq), CastProbeArgDesc(d1.name), CastProbeArgDesc(d1.duration),
+                            rem, CastProbeArgDesc(d1.applications)))
+                    else
+                        print(string.format("  直查 id=%s: 没有该 aura (ok=%s)", tostring(idq), tostring(ok1)))
+                    end
+                end
+            end
+            -- ★ 这一行是"改用 aura 驱动"值不值的直接读数:
+            --   差>0 = 模型窗口比真实 buff 早结束(少补加速); 差<0 = 模型窗口偏长(多补)
+            local remAb, stAb = ReadFlowAuraRemain()
+            local winAb = (flowUntil > nowA) and (flowUntil - nowA) or 0
+            if remAb then
+                print(string.format("  ★ 窗口对比: 模型推算=%.1fs  buff真实=%.1fs  差=%+.2fs  (%s)",
+                    winAb, remAb, winAb - remAb,
+                    (remAb > 0.05) and "buff在身, 可作驱动源" or "buff已过期/将尽"))
+            else
+                print(string.format("  ★ 窗口对比: 模型推算=%.1fs  buff读不到(%s) -> 只能靠事件推算",
+                    winAb, tostring(stAb)))
+            end
+            print("  --- 身上 helpful aura (找 duration≈10s 的那个, 很可能就是心流 buff) ---")
+            local n = 0
+            for i = 1, 40 do
+                local ok2, d2 = pcall(C_UnitAuras.GetAuraDataByIndex, "player", i, "HELPFUL")
+                if not ok2 or d2 == nil then break end
+                local rem2 = "?"
+                pcall(function()
+                    if type(d2.expirationTime) == "number" and d2.expirationTime > 0 then
+                        rem2 = string.format("%.1fs", d2.expirationTime - nowA)
+                    end
+                end)
+                print(string.format("    [%d] id=%s name=%s dur=%s 剩余=%s",
+                    i, CastProbeArgDesc(d2.spellId), CastProbeArgDesc(d2.name),
+                    CastProbeArgDesc(d2.duration), rem2))
+                n = n + 1
+            end
+            print(string.format("  共 %d 个 helpful aura (若值为 secret 说明战斗中读不到)", n))
+        end)
+        if not okA then print("|cFF7F77DD[绿喷管家]|r aura 探针异常: " .. tostring(errA)) end
+    elseif cmd == "time" then
+        -- v1.36.3: 充能计时对账 —— 连续采样"引擎剩余 vs 模型剩余", 量化绿喷充能计时误差
+        --   原理: 引擎句柄(DurationObject)是游戏自己的剩余秒; 模型是自己推的。两者同帧取数做差。
+        --   限制: 战斗中引擎剩余是 secret(不能算术), 所以必须在**脱战**下测; 且要"正在充能(不满层)"。
+        print("|cFF7F77DD[绿喷管家]|r 计时对账 —— 绿喷充能 + 静滞CD (每 1s 采一次):")
+        print("  前提: ① 脱战(战斗中引擎剩余与 API 都是 secret, 算不出差); ② 绿喷要'正在充能'(满层没有'下一层'可比)")
+        print("       测绿喷: **敲完命令后、采样期间**放一口绿喷(2->1) —— 这样才有'★层数变化'标记,")
+        print("               看得出'新层起算'用的时长对不对(折算=27.27 / 没折=30)。")
+        print("               (只在敲命令前放, 会被'起点对齐'掩盖 —— 对齐后按真实秒走, 差恒 0 看不出折算错)")
+        print("       测静滞: 静滞在 CD 中, 且最好刚放过技能(心流窗口内)")
+        print("       采样期间暂停**所有**官方值校准(含每帧校准), 所以'模型'列是它自己走的原始值")
+        print("       最有价值的一次: 让采样**跨过心流窗口过期**(放一口技能后第 5-7 秒开测), 就能看出引擎速率是否跟着变")
+        -- v1.36.5: 静滞 API 原始字段 —— 用引擎自己的 rate 判定"静滞CD 到底吃不吃心流加速"
+        --   (rate<1 表示游戏认为它在加速; 若恒为 1 而我们却在加速, 就是我们在多算)
+        pcall(function()
+            local cd = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(STASIS_SPELL_ID)
+            if type(cd) == "table" then
+                local p = {}
+                for k, v in pairs(cd) do
+                    if type(v) ~= "table" then
+                        p[#p + 1] = tostring(k) .. "=" .. CastProbeArgDesc(v)
+                    end
+                end
+                print("  静滞API原始字段: " .. table.concat(p, " "))
+            else
+                print("  静滞API原始字段: 取不到 (C_Spell.GetSpellCooldown 返回 " .. tostring(cd) .. ")")
+            end
+        end)
+        local N = 20   -- v1.36.23: 8 -> 20 秒, 拉长观察窗才看得出漂移
+        local flowOpenCnt = 0   -- v1.36.25: 统计有几个采样点落在心流窗口内 —— 判读必需
+        -- v1.36.28: 心流 buff 直读统计(脱战) + 模型窗口与 buff 真实的偏差累计
+        local auraOpenCnt, auraDiffSum, auraDiffN = 0, 0, 0
+        local combatSampleCnt = 0   -- v1.36.35: 有几个采样点落在战斗中(aura 读不到是正常的, 不是"没心流")
+        --   (没有这一项就会像 01:51 那轮: 差全是 0.00s 看着完美, 其实全程**没有心流窗口**, 什么也没测到)
+        local idx = 0
+        -- v1.36.23: 采样前**强制对齐一次起点**(用官方值), 然后才暂停校准 ——
+        --   这样之后模型是"从与游戏一致的起点"自己往下走(折算照做, 因为那才是它的真实行为);
+        --   **差值一旦漂移, 就是纯粹的算法偏差**(排除了起点差与校准残留)。
+        pcall(SyncStasisCooldownFromAPI)
+        pcall(function()
+            local inf = GetSpellChargeInfo(DREAM_BREATH_SPELL_ID)
+            if inf and not inf.secret then SyncChargeModel(inf) end
+        end)
+        print("  (已把模型起点对齐官方值, 然后暂停校准 —— 之后看它自己走得准不准)")
+        probeSuspendSync = true      -- v1.36.7/23: 起点已对齐, 采样期间暂停校准
+        -- 上一采样值, 用于算"每秒走了多少秒"(Δ) —— 差值是绝对值, Δ 才能看出谁走得快
+        local pGEng, pGMod, pSEng, pSMod, pApi = nil, nil, nil, nil, nil
+        -- v1.36.26: 上一采样的绿喷层数 —— 用来标记"★层数变化"(= 模型刚经历一次新层起算)。
+        --   为什么必需: 采样前的"起点对齐"会把模型拉到与官方一致, 于是"**起算折算算错**"这类偏差
+        --   会被起点对齐掩盖(对齐后按真实秒走, 差恒为 0 看着完美)。只有在采样**期间**发生一次起算,
+        --   才能看出新层用的时长对不对(折算=27.27 / 没折=30)。
+        local pGChg = nil
+        local sawChargeChange = false   -- v1.36.26: 采样期间是否发生过"新层起算"(没有的话测不到折算)
+        -- v1.36.8: 速率统计 —— 直接回答"引擎会不会跟着 rate 变"(定性游戏怎么处理心流加速)
+        local rateN, rateApiN, rateEng, rateMod, rateApi = 0, 0, 0, 0, 0
+        -- 绿喷充能 (G) 与 静滞 CD (S) 两组统计
+        local gSum, gMn, gMx, gFirst, gLast, gN = 0, nil, nil, nil, nil, 0
+        local sSum, sMn, sMx, sFirst, sLast, sN = 0, nil, nil, nil, nil, 0
+        local function sampleOnce()
+            idx = idx + 1
+            -- v1.36.28: 先让**模型自己走一步** —— 脱战时 EvaluateState 走的是 API 分支, 不会调用
+            --   `GetLocalChargeInfo()`(模型的推进器) → 采样期间模型卡住、永不涨层
+            --   (02:03 实测: #15 之后模型显示 -0.9s 并一路 -1.0/秒, 就是涨层结算没跑)。
+            --   它是纯本地计算(不碰 API), 主动推一次即可, 不影响"暂停校准"。
+            pcall(GetLocalChargeInfo)
+            local t = GetTime()
+            -- v1.36.28: 直读心流 aura (脱战可读, ID 390148) —— 老板要求"看得出来这次到底有没有心流";
+            --   顺便量化"模型窗口 vs buff 真实剩余"的偏差(模型窗口从 SUCCEEDED 起算, 天然偏早)。
+            local auraRem, auraState = ReadFlowAuraRemain()
+            local flowWindowRem = (flowUntil > t) and (flowUntil - t) or nil
+            -- v1.36.35: 上一次采样到这一次之间若发生过"心流速率换算", 在行尾标注原因与幅度。
+            --   直接回答"模型为什么突然跳了 ±8s" —— 战斗中读不到 aura, 换算该不该发生没法当场核对,
+            --   但至少"发生了什么"要看得见(否则一跳就只剩猜)。采样间隔 1s, 取 1.2s 覆盖。
+            local _inCombat = false
+            local okCb, cb = pcall(function() return InCombatLockdown and InCombatLockdown() end)
+            if okCb and cb then _inCombat = true end
+            if _inCombat then combatSampleCnt = combatSampleCnt + 1 end
+            local convNote = nil
+            if lastFlowConv and (t - (lastFlowConv.t or 0)) <= 1.2 then
+                local bits = {}
+                if math.abs(lastFlowConv.dStasis or 0) > 0.05 then
+                    bits[#bits + 1] = string.format("静滞%+.1fs", lastFlowConv.dStasis)
+                end
+                if math.abs(lastFlowConv.dCharge or 0) > 0.05 then
+                    bits[#bits + 1] = string.format("绿喷%+.1fs", lastFlowConv.dCharge)
+                end
+                if #bits > 0 then
+                    convNote = string.format(" ‹心流%s换算 x%.3f: %s›",
+                        lastFlowConv.tag, lastFlowConv.mul, table.concat(bits, " "))
+                end
+            end
+            local modelRem, engRem, engSecret, hasHandle = nil, nil, false, false
+            local modelStasis, engStasis, engStasisSecret, hasStasis = nil, nil, false, false
+            -- v1.36.26: 检出"本次采样期间模型刚起算过新层"(层数变化) -> 打 ★ 标记
+            local chgNow = chargeModel.currentCharges
+            local chgMark = ""
+            if pGChg ~= nil and tostring(chgNow) ~= tostring(pGChg) then
+                chgMark = string.format(" ★层数%s->%s(新层起算! 看这行之下的差)", tostring(pGChg), tostring(chgNow))
+                sawChargeChange = true
+            end
+            pGChg = chgNow
+            -- v1.36.7: 静滞的官方 API 值(可读时) —— 用来定性"游戏怎么处理心流加速"
+            local apiRem, apiRate, apiDur, apiActive = nil, nil, nil, nil
+            pcall(function()
+                if chargeModel.currentCharges and chargeModel.nextChargeAt
+                   and chargeModel.currentCharges < (chargeModel.maxCharges or 2) then
+                    modelRem = chargeModel.nextChargeAt - t
+                end
+                -- v1.36.13 门控放宽到 ARMED: 静滞"存满进 ARMED"时 cooldownEndTime 就已设好、CD 已在跑,
+                --   只认 COOLDOWN 会把 ARMED 阶段误报成"模型不在CD/锚点偏晚"(2026-09-21 01:03 实测踩到)。
+                if (stasisState.phase == "ARMED" or stasisState.phase == "COOLDOWN")
+                   and (stasisState.cooldownEndTime or 0) > t then
+                    modelStasis = stasisState.cooldownEndTime - t
+                end
+            end)
+            pcall(function()
+                local cd = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(STASIS_SPELL_ID)
+                if type(cd) == "table" then
+                    if IsSafeNumber(cd.timeUntilEndOfStartRecovery) then apiRem = cd.timeUntilEndOfStartRecovery end
+                    if IsSafeNumber(cd.modRate) then apiRate = cd.modRate end
+                    if IsSafeNumber(cd.duration) then apiDur = cd.duration end
+                    if type(cd.isActive) == "boolean" then apiActive = cd.isActive end
+                end
+            end)
+            pcall(function()
+                EngineInvalidate()          -- 关键: 句柄有 1s 缓存, 不失效会拿旧值 -> 假漂移
+                local h = EngineChargeHandle()
+                if h then
+                    hasHandle = true
+                    engRem, engSecret = EngineRemaining(h)
+                end
+                local hs = EngineStasisHandle()
+                if hs then
+                    hasStasis = true
+                    engStasis, engStasisSecret = EngineRemaining(hs)
+                end
+            end)
+            local parts = {}
+            -- ① 绿喷充能
+            if engSecret then
+                parts[#parts + 1] = "绿喷: 引擎=secret(战斗中读不到)"
+            elseif engRem and modelRem then
+                local d = modelRem - engRem
+                gN = gN + 1; gSum = gSum + d
+                if gMn == nil or d < gMn then gMn = d end
+                if gMx == nil or d > gMx then gMx = d end
+                if gN == 1 then gFirst = d end
+                gLast = d
+                local spd = ""
+                if pGEng and pGMod then
+                    spd = string.format(" [Δ引擎%+.1f Δ模型%+.1f]", engRem - pGEng, modelRem - pGMod)
+                end
+                pGEng, pGMod = engRem, modelRem
+                parts[#parts + 1] = string.format("绿喷: 引擎=%.1fs 模型=%.1fs 差=%+.1fs%s%s", engRem, modelRem, d, spd, chgMark)
+            elseif not hasHandle then
+                parts[#parts + 1] = string.format("绿喷: 引擎无句柄(满层/没在充能) 模型=%s%s",
+                    modelRem and string.format("%.1fs", modelRem) or "无", chgMark)
+            else
+                parts[#parts + 1] = "绿喷: 引擎剩余读不到"
+            end
+            -- ② 静滞 CD (判断公式里的 T)
+            local sApi = ""
+            if apiRem then
+                sApi = string.format("API=%.1fs(rate=%.3f dur=%.1f)", apiRem, apiRate or 0, apiDur or 0)
+            end
+            if engStasisSecret then
+                parts[#parts + 1] = "静滞CD: 引擎=secret(战斗中读不到) " .. sApi
+            elseif engStasis and modelStasis then
+                local d = modelStasis - engStasis
+                sN = sN + 1; sSum = sSum + d
+                if sMn == nil or d < sMn then sMn = d end
+                if sMx == nil or d > sMx then sMx = d end
+                if sN == 1 then sFirst = d end
+                sLast = d
+                local spd = ""
+                if pSEng and pSMod then
+                    local dE, dM = engStasis - pSEng, modelStasis - pSMod
+                    spd = string.format(" [Δ引擎%+.1f Δ模型%+.1f]", dE, dM)
+                    -- 累计"每秒走掉多少秒"(取正): 引擎 vs 模型 vs API
+                    if dE < 0 then rateEng = rateEng - dE end
+                    if dM < 0 then rateMod = rateMod - dM end
+                    rateN = rateN + 1
+                    if apiRem and pApi and (pApi - apiRem) > 0 then
+                        rateApi = rateApi + (pApi - apiRem)
+                        rateApiN = rateApiN + 1
+                    end
+                end
+                pSEng, pSMod = engStasis, modelStasis
+                pApi = apiRem
+                parts[#parts + 1] = string.format("静滞CD: 引擎=%.1fs %s 模型=%.1fs 差=%+.1fs%s",
+                    engStasis, sApi, modelStasis, d, spd)
+            elseif modelStasis then
+                parts[#parts + 1] = string.format("静滞CD: 引擎无数据 %s 模型=%.1fs", sApi, modelStasis)
+            elseif apiRem then
+                -- v1.36.13: 修掉门控后, 走到这里只剩一种情况 —— 模型还没设 cooldownEndTime
+                --   (静滞仍在 STORING 存技能中, OnStasisArmed 未触发)。别再喊"锚点偏晚"(那是误报)。
+                parts[#parts + 1] = string.format("静滞CD: 模型尚在存技能(未起算) | 官方 %s", sApi)
+            else
+                parts[#parts + 1] = "静滞CD: 不在CD中(想测它就先开一次静滞, 脱战后再敲本命令)"
+            end
+            if flowUntil > GetTime() then flowOpenCnt = flowOpenCnt + 1 end   -- v1.36.25
+            -- v1.36.28: 心流 buff 直读(脱战可读) —— 一眼看出"这次有没有心流", 并与模型窗口对账
+            if auraRem then
+                auraOpenCnt = auraOpenCnt + 1
+                if flowWindowRem then
+                    local wd = flowWindowRem - auraRem
+                    auraDiffSum = auraDiffSum + wd; auraDiffN = auraDiffN + 1
+                    parts[#parts + 1] = string.format("心流buff=%.1fs 模型窗口=%.1fs (差%+.1fs)", auraRem, flowWindowRem, wd)
+                else
+                    parts[#parts + 1] = string.format("心流buff=%.1fs **[模型窗口已关!]**", auraRem)
+                end
+            elseif auraState == "secret" then
+                parts[#parts + 1] = "心流buff=secret(战斗中)"
+            elseif auraState == "noaura" and _inCombat then
+                -- v1.36.35: 战斗中 aura 整条通道被屏蔽(遍历返回 0 个), 以前这里打"无(noaura)"
+                --   会被读成"身上没有心流 buff" —— 其实只是**读不到**。战斗中请只看上面的"模型窗口"。
+                parts[#parts + 1] = "心流buff=战斗中读不到(看'模型窗口')"
+            else
+                parts[#parts + 1] = "心流buff=无(" .. tostring(auraState) .. ")"
+            end
+            if convNote then parts[#parts + 1] = convNote end
+            print(string.format("  #%d %s", idx, table.concat(parts, " | ")))
+        end
+        local function summarize(tag, n, sum, mn, mx, first, last)
+            if n > 0 then
+                local avg = sum / n
+                local trend = (last and first) and (last - first) or 0
+                print(string.format("  --- %s 小结: 有效 %d/%d | 平均差 %+.2fs | 范围 %+.2fs ~ %+.2fs | 末-首 %+.2fs",
+                    tag, n, idx, avg, mn, mx, trend))
+            else
+                print(string.format("  --- %s 小结: 没有有效样本(原因见上面各行)", tag))
+            end
+        end
+        local function finish()
+            probeSuspendSync = false     -- 采样结束, 恢复正常校准
+            summarize("绿喷充能", gN, gSum, gMn, gMx, gFirst, gLast)
+            summarize("静滞CD", sN, sSum, sMn, sMx, sFirst, sLast)
+            -- v1.36.25: 窗口覆盖率 —— 没有它, "差全 0"可能是"根本没开窗", 会误判为"完美"
+            print(string.format("  心流窗口(模型推算): 采样期 %d/%d 个点落在窗口内 %s",
+                flowOpenCnt, idx,
+                (flowOpenCnt > 0) and "(含加速场景 ✓)" or "!! 全程无窗口 —— 这次测不到心流影响, 请放一口红喷/绿喷后 10 秒内重测"))
+            -- v1.36.28: 直读 aura 的统计(脱战可读) —— 老板要求"能看出有没有心流"; 顺便量化窗口偏差
+            if auraOpenCnt > 0 or auraDiffN > 0 then
+                print(string.format("  心流buff(直读aura): %d/%d 个采样点在 buff 内 %s",
+                    auraOpenCnt, idx,
+                    (auraOpenCnt > 0) and "✓ 这次确实测到了心流场景" or "!! 但窗口推算说有 —— 两者不一致, 查开窗时机"))
+                if auraDiffN > 0 then
+                    print(string.format("  窗口精度: 模型窗口 - buff真实 = 平均 %+.2fs (%d 样本; 正=模型窗口偏长, 负=偏短)",
+                        auraDiffSum / auraDiffN, auraDiffN))
+                end
+            elseif combatSampleCnt > 0 then
+                -- v1.36.35: 战斗中 aura 整条通道被屏蔽 -> 不能据此说"没有心流"。
+                --   战斗中的窗口中状态**只能**看上面那行"模型推算"(事件驱动, 战斗中可用)。
+                print(string.format("  心流buff(直读aura): %d/%d 个采样点在战斗中 —— **战斗中 aura 读不到是正常现象**" ..
+                    "(暴雪屏蔽整条通道: 脱战 12 个 / 战斗 0 个)", combatSampleCnt, idx))
+                print("      → 战斗中心流**只能靠'模型推算'那行**(事件驱动); 直读仅脱战可用")
+            else
+                print("  心流buff(直读aura): 全程没有 buff —— 这次**没测到心流场景**(需在采样期间放一口红喷/绿喷)")
+            end
+            -- v1.36.26: "有没有发生新层起算" —— 没有的话, 折算对不对根本测不到(会被起点对齐掩盖)
+            if sawChargeChange then
+                print("  ✓ 采样期间发生过新层起算(★) —— 起算折算对不对, 看 ★ 之后那几行的'差'是否仍接近 0")
+            else
+                print("  ⚠ 采样期间**没有**新层起算(无 ★ 标记) —— 本次测不出'起算折算'对不对!")
+                print("     正确测法: **敲完本命令后**、采样进行中, 放一口绿喷(2->1), 让模型起算一次新层")
+            end
+            -- v1.36.13: 顺带报"锚点差"(游戏 startTime vs 模型 cdStart) —— 脱战可读, 一眼看出锚点有没有偏
+            pcall(function()
+                local cd = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(STASIS_SPELL_ID)
+                if type(cd) ~= "table" then return end
+                local gStart = cd.startTime or cd.startRecoveryTime
+                if issecretvalue and issecretvalue(gStart) then return end
+                if type(gStart) ~= "number" or gStart <= 0 then return end
+                local a = stasisState.cdAnchoredAt or 0
+                if a <= 0 then return end
+                local diff = a - gStart
+                print(string.format("  静滞锚点: 游戏start=%.1f | 模型cdStart=%.1f | 差=%+.2fs (%s)",
+                    gStart, a, diff, (math.abs(diff) <= 1.0) and "<=1s 可接受" or "偏大, 需查 thirdCastStartTime 记录"))
+            end)
+            -- v1.36.8: 速率结论 —— 这是"游戏怎么处理心流加速"的定性依据
+            if rateN > 0 then
+                print(string.format("  速率实测(每秒走掉多少秒): 引擎 %.2f | 模型 %.2f | API %.2f  (静滞 %d 次, API %d 次)",
+                    rateEng / rateN, rateMod / rateN, rateApiN > 0 and (rateApi / rateApiN) or 0, rateN, rateApiN))
+                print("  判读: 若 rate<1(有加速)时引擎仍走 1.00 -> 游戏是「CD开始时按当时rate折算总时长, 之后按真实秒倒数」")
+                print("        -> 模型机制要改成'起算时折算'; 若引擎跟着走 1.10 -> 游戏按实时rate递减, 机制对, 只需修锚点")
+            else
+                print("  速率实测: 静滞样本不足(需连续采样中有静滞在 CD)")
+            end
+            print("  判读: |差|<=1s = 准; 1~2s = 可接受(点心流时容易到这档); >3s = 模型漂了, 把上面几行发我")
+            print("       '末-首'偏向一边 = 系统性漂移; 正差=模型偏慢(倒计时比游戏晚), 负差=模型偏快(危险: 会提前说随便喷)")
+        end
+        sampleOnce()
+        if C_Timer and C_Timer.NewTicker then
+            local ticker
+            ticker = C_Timer.NewTicker(1, function()
+                sampleOnce()
+                if idx >= N then
+                    if ticker then pcall(function() ticker:Cancel() end) end
+                    finish()
+                end
+            end)
+        else
+            finish()
+        end
+    elseif cmd == "cast" then
+        -- v1.36.1: 蓄力施法事件探针 (排查"蓄力被取消却仍算作释放")
+        print("|cFF7F77DD[绿喷管家]|r 蓄力施法事件探针 (v" .. tostring(ADDON_VERSION) .. "):")
+        print("  复现: 绿喷满2层 -> 按住绿喷蓄力 -> 按 Esc 取消 -> 回聊天框敲 /DBSH cast")
+        print("  看什么: ① 取消那一下有没有 SUCCEEDED(355936/382614); ② EMPOWER_STOP 的 a4[complete] 是真值还是 secret")
+        local okP, errP = pcall(function()
+            local nextIn = 0
+            if chargeModel.nextChargeAt and chargeModel.currentCharges
+               and chargeModel.currentCharges < chargeModel.maxCharges then
+                nextIn = math.max(0, chargeModel.nextChargeAt - GetTime())
+            end
+            print(string.format("  当前: 模型层=%s/%s, 下一层%.1fs | used=%s | 资格=%s",
+                tostring(chargeModel.currentCharges), tostring(chargeModel.maxCharges), nextIn,
+                tostring(usageCounter.used), tostring(eligibility.eligible)))
+        end)
+        if not okP then print("|cFFFF0000[绿喷管家]|r 状态读取异常: " .. tostring(errP)) end
+        print("  --- 事件记录 (最近 " .. tostring(#castProbe) .. " 条, 最早在上) ---")
+        if #castProbe == 0 then
+            print("    (空: 还没记到事件 —— 先做一次'蓄力→取消'再敲本命令)")
+        else
+            for _, l in ipairs(castProbe) do print("    " .. l) end
+        end
+        print("  ↳ 参数: a1[unit] a2[castGUID] a3[spellID] a4[complete] a5[interruptedBy] a6[castBarID]; secret=被加密读不到")
     elseif cmd == "charge" then
         -- v1.32.9: 绿喷充能记账诊断 —— "本地模型 vs 游戏API" 逐项对比 + 最近事件流水
         print("|cFF7F77DD[绿喷管家]|r 绿喷充能诊断:")
@@ -3257,6 +4230,41 @@ SlashCmdList["DBSH"] = function(msg)
             end
             print(string.format("  静滞CD: phase=%s, 剩余%.2fs (吃心流加速)",
                 tostring(stasisState.phase), sLeft))
+            -- v1.36.11 锚点对比: 游戏 CD 的**真实起点** vs 模型锚点 —— 定性"静滞CD从哪一刻起算"
+            --   游戏侧 startTime (GetTime 基准真值, 脱战可读): 若 ≈"按下静滞"时刻 → 按下即CD;
+            --   若 ≈"第3技能开始+1.3s" → 存满才CD。这一行决定锚点要不要提前。
+            pcall(function()
+                local cd = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(STASIS_SPELL_ID)
+                if type(cd) ~= "table" then return end
+                local gStart = cd.startTime or cd.startRecoveryTime
+                if issecretvalue and issecretvalue(gStart) then
+                    print("  静滞CD锚点对比: 游戏startTime=secret(战斗中读不到) -> 脱战后敲")
+                    return
+                end
+                if type(gStart) ~= "number" or gStart <= 0 then return end
+                local anchor = stasisState.cdAnchoredAt or 0
+                local press  = stasisState.activeStartTime or 0
+                local third  = stasisState.thirdCastStartTime or 0
+                if anchor <= 0 and press <= 0 then return end
+                -- v1.36.37: **加打"游戏 duration 与结束时刻"** —— 判断灯色真正依赖的是"CD 什么时候结束",
+                --   而它 = start + duration。只看"锚点差"会被"起点差"和"时长差"互相抵消搞糊涂
+                --   (2026-09-21 长战斗实测: 锚点差 +5.0s, 但模型剩余只比游戏多 0.6s —— 两者抵消了)。
+                local gDur = cd.duration
+                local gEnd = (type(gDur) == "number" and gDur > 0) and (gStart + gDur) or nil
+                local mEnd = stasisState.cooldownEndTime
+                print(string.format("  静滞CD锚点对比: 游戏start=%.1f dur=%s end=%s | 模型锚点=%.1f end=%s | 端差=%s",
+                    gStart,
+                    (type(gDur) == "number") and string.format("%.1f", gDur) or "?",
+                    gEnd and string.format("%.1f", gEnd) or "?",
+                    anchor,
+                    mEnd and string.format("%.1f", mEnd) or "?",
+                    (gEnd and mEnd) and string.format("%+.1fs (这才是判断依据!)", mEnd - gEnd) or "?"))
+                print(string.format("    参考: 按下静滞=%.1f (游戏start%+.1fs) | 第3技能开始%s",
+                    press, press - gStart,
+                    (third > 0) and string.format("=%.1f (%+.1fs)", third, third - gStart) or "未记录"))
+                print("    判读: **看'端差'**(模型CD结束 vs 游戏CD结束) —— 它≈0 就说明判断依据是对的;")
+                print("          锚点差与 dur 差只要互相抵消, 端差仍可≈0 (锚点语义不必强行对齐)")
+            end)
             -- v1.33: 引擎句柄通道 (战斗中 secret-safe 的官方显示源)
             local okE, errE = pcall(function()
                 if not EngineSupported() then
@@ -3400,6 +4408,9 @@ _G.DreamBreathStasisHelper = {
     EngineRemaining = EngineRemaining,
     EngineChargesInfo = EngineChargesInfo,
     EngineInvalidate = EngineInvalidate,
+    -- v1.36.2: 蓄力取消回滚 —— 暴露给测试/调试 (读本地模型层数/已用, 与回滚次数)
+    GetChargeModelState = function() return chargeModel.currentCharges, chargeModel.maxCharges, usageCounter.used end,
+    GetCancelRollbackCount = function() return empowerRollbackCount end,
     Constants = {
         DREAM_BREATH_SPELL_ID = DREAM_BREATH_SPELL_ID,
         STASIS_SPELL_ID = STASIS_SPELL_ID,
